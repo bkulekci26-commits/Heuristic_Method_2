@@ -15,9 +15,9 @@ import java.util.*;
  *   3. Receiver route k2 PICKS UP transferQty at node j (detour or existing visit)
  *   4. k2 uses the gained capacity to INSERT a high-profit unserved node 'u'
  *
- * Accept if: profit(u) - profit(s) - α × Δdistance > 0
+ * Accept if: profit(u) - profit(s) > 0  (net profit gain from swap)
  *
- * Synchronization: |arrivalTime_k1(j) - arrivalTime_k2(j)| ≤ W
+ * Synchronization: arrivalTime_giver - arrivalTime_receiver ≤ W  (directional)
  *
  * This mechanism is adapted from:
  *   - Aguayo et al. (2025): VRP-T Transform step (drop remaining capacity)
@@ -27,10 +27,7 @@ import java.util.*;
  */
 public class TransferOptimizer {
 
-    private final double objectiveAlpha;
-
-    public TransferOptimizer(double objectiveAlpha) {
-        this.objectiveAlpha = objectiveAlpha;
+    public TransferOptimizer() {
     }
 
     // ══════════════════════════════════════════════════════════
@@ -41,23 +38,50 @@ public class TransferOptimizer {
         int totalTransfers = 0;
         boolean improved = true;
 
-        while (improved) {
+        // Track failed transfer configurations to avoid retrying
+        Set<String> failedTransfers = new HashSet<>();
+        int maxFailedAttempts = 50; // safety limit
+
+        while (improved && failedTransfers.size() < maxFailedAttempts) {
             improved = false;
-            TransferCandidate best = findBestRemoveTransferInsert(solution);
+            TransferCandidate best = findBestRemoveTransferInsert(solution, failedTransfers);
 
             if (best != null) {
-                executeTransfer(solution, best);
-                totalTransfers++;
-                improved = true;
+                String transferKey = best.giverRouteIdx + "-" + best.removedNodeId + "-"
+                        + best.transferNodeId + "-" + best.receiverRouteIdx + "-" + best.newCustomerId;
 
-                System.out.printf("[Transfer] v%d removes node %d (p=%.0f,d=%.0f), " +
-                                "drops %.0f at node %d → v%d picks up → inserts node %d (p=%.0f,d=%.0f) | gain=%.2f%n",
-                        best.giverRouteIdx, best.removedNodeId,
-                        best.removedProfit, best.removedDemand,
-                        best.transferQty, best.transferNodeId,
-                        best.receiverRouteIdx, best.newCustomerId,
-                        best.newCustProfit, best.newCustDemand,
-                        best.objGain);
+                // Test on a COPY first
+                Solution testCopy = new Solution(solution);
+                executeTransfer(testCopy, best);
+
+                // Validate feasibility on the copy
+                if (testCopy.isFeasible()) {
+                    // Safe to apply — execute on the actual solution
+                    executeTransfer(solution, best);
+                    totalTransfers++;
+                    improved = true;
+
+                    System.out.printf("[Transfer] v%d removes node %d (p=%.0f,d=%.0f), " +
+                                    "drops %.0f at node %d → v%d picks up → inserts node %d (p=%.0f,d=%.0f) | gain=%.2f%n",
+                            best.giverRouteIdx, best.removedNodeId,
+                            best.removedProfit, best.removedDemand,
+                            best.transferQty, best.transferNodeId,
+                            best.receiverRouteIdx, best.newCustomerId,
+                            best.newCustProfit, best.newCustDemand,
+                            best.objGain);
+                } else {
+                    // This candidate produces infeasible result — diagnose and skip
+                    Solution.FeasibilityReport report = testCopy.checkFeasibility();
+                    System.out.printf("[Transfer] REJECTED (infeasible after execution): " +
+                                    "remove=%d, transfer_node=%d, new_cust=%d, giver=v%d, receiver=v%d%n",
+                            best.removedNodeId, best.transferNodeId, best.newCustomerId,
+                            best.giverRouteIdx, best.receiverRouteIdx);
+                    for (String v : report.getViolations()) {
+                        System.out.println("  Violation: " + v);
+                    }
+                    failedTransfers.add(transferKey);
+                    improved = true; // continue searching for other candidates
+                }
             }
         }
 
@@ -68,7 +92,7 @@ public class TransferOptimizer {
     // FIND BEST REMOVE-TRANSFER-INSERT MOVE
     // ══════════════════════════════════════════════════════════
 
-    private TransferCandidate findBestRemoveTransferInsert(Solution solution) {
+    private TransferCandidate findBestRemoveTransferInsert(Solution solution, Set<String> failedTransfers) {
         Instance inst = solution.getInstance();
         List<Route> routes = solution.getRoutes();
         List<Node> unserved = solution.getUnservedNodes();
@@ -128,6 +152,11 @@ public class TransferOptimizer {
                             double neededFromTransfer = newCust.getDemand() - receiverSlack;
                             if (neededFromTransfer <= 0) continue; // doesn't need transfer
                             if (neededFromTransfer > freedCapacity) continue; // giver can't provide enough
+
+                            // Skip previously failed configurations
+                            String candidateKey = gi + "-" + removedNode.getId() + "-"
+                                    + transferNodeId + "-" + ri + "-" + newCust.getId();
+                            if (failedTransfers.contains(candidateKey)) continue;
 
                             double transferQty = neededFromTransfer;
 
@@ -228,7 +257,7 @@ public class TransferOptimizer {
 
         // Check sync
         double recArrival = recTest.getArrivalTimeAtNode(transferNodeId);
-        if (Math.abs(giverArrivalAtJ - recArrival) > inst.getSyncWindow() + 1e-6) return null;
+        if (giverArrivalAtJ - recArrival > inst.getSyncWindow() + 1e-6) return null;
 
         // Try inserting new customer at each position
         TransferCandidate best = null;
@@ -239,7 +268,7 @@ public class TransferOptimizer {
             if (recTest.isFeasible()) {
                 // Re-check sync after insertion (arrival times may shift)
                 double recArrival2 = recTest.getArrivalTimeAtNode(transferNodeId);
-                if (Math.abs(giverArrivalAtJ - recArrival2) <= inst.getSyncWindow() + 1e-6) {
+                if (giverArrivalAtJ - recArrival2 <= inst.getSyncWindow() + 1e-6) {
                     double newObj = computeObjWith(solution, gi, giverTest, ri, recTest);
                     double gain = newObj - currentObj;
 
@@ -290,7 +319,7 @@ public class TransferOptimizer {
                 recArrival = recTest.getArrivalTimeAtNode(transferNode.getId());
             } catch (Exception e) { continue; }
 
-            if (Math.abs(giverArrivalAtJ - recArrival) > inst.getSyncWindow() + 1e-6) continue;
+            if (giverArrivalAtJ - recArrival > inst.getSyncWindow() + 1e-6) continue;
 
             // Try inserting new customer at each position
             for (int nPos = 0; nPos <= recTest.size(); nPos++) {
@@ -304,7 +333,7 @@ public class TransferOptimizer {
                         recArrival2 = recTest.getArrivalTimeAtNode(transferNode.getId());
                     } catch (Exception e) { recTest.removeStop(nPos); recTest.evaluate(); continue; }
 
-                    if (Math.abs(giverArrivalAtJ - recArrival2) <= inst.getSyncWindow() + 1e-6) {
+                    if (giverArrivalAtJ - recArrival2 <= inst.getSyncWindow() + 1e-6) {
                         double newObj = computeObjWith(solution, gi, giverTest, ri, recTest);
                         double gain = newObj - currentObj;
 
@@ -402,23 +431,21 @@ public class TransferOptimizer {
 
     private double computeObjWith(Solution sol, int gi, Route giverNew,
                                   int ri, Route receiverNew) {
-        double profit = 0, dist = 0;
+        double profit = 0;
         List<Route> routes = sol.getRoutes();
         for (int i = 0; i < routes.size(); i++) {
             Route r = (i == gi) ? giverNew : (i == ri) ? receiverNew : routes.get(i);
             profit += r.getTotalProfit();
-            dist += r.getTotalDistance();
         }
-        return profit - objectiveAlpha * dist;
+        return profit;
     }
 
     private double computeObjective(Solution sol) {
-        double profit = 0, dist = 0;
+        double profit = 0;
         for (Route r : sol.getRoutes()) {
             profit += r.getTotalProfit();
-            dist += r.getTotalDistance();
         }
-        return profit - objectiveAlpha * dist;
+        return profit;
     }
 
     // ══════════════════════════════════════════════════════════

@@ -10,9 +10,8 @@ import java.util.Set;
  *   - A set of routes (one per vehicle, some may be empty)
  *   - A set of transfers between vehicles at customer nodes
  *
- * Objective function (eq. 1):
- *   max Z = Σ pj·zjk - α · Σ cij·xijk
- *         = total_profit - α · total_distance
+ * Objective function:
+ *   max Z = Σ pj·zjk   (maximize total collected profit)
  *
  * Global feasibility requires:
  *   1. Each route individually feasible (time + capacity)
@@ -25,13 +24,11 @@ public class Solution {
     private final Instance instance;
     private final List<Route> routes;
     private final List<Transfer> transfers;
-    private final double alpha;          // penalty coefficient for distance
 
     // ──────────────────────────── Constructors ───────────────────────────────
 
-    public Solution(Instance instance, double alpha) {
+    public Solution(Instance instance) {
         this.instance = instance;
-        this.alpha = alpha;
         this.routes = new ArrayList<>();
         this.transfers = new ArrayList<>();
     }
@@ -39,19 +36,18 @@ public class Solution {
     /** Deep copy constructor */
     public Solution(Solution other) {
         this.instance = other.instance;
-        this.alpha = other.alpha;
         this.routes = new ArrayList<>();
         for (Route r : other.routes) {
             this.routes.add(new Route(r));
         }
-        this.transfers = new ArrayList<>(other.transfers); // shallow copy OK for now
+        this.transfers = new ArrayList<>(other.transfers);
     }
 
     // ──────────────────────────── Objective Function ─────────────────────────
 
-    /** Objective value: total profit - α × total distance  (eq. 1) */
+    /** Objective value = total collected profit */
     public double getObjectiveValue() {
-        return getTotalProfit() - alpha * getTotalDistance();
+        return getTotalProfit();
     }
 
     /** Sum of profits from all served customers across all routes */
@@ -116,15 +112,42 @@ public class Solution {
 
         // 4. Synchronization window (constraint 17)
         for (Transfer t : transfers) {
-            double giverTime = getArrivalTimeAtNode(t.getGivingVehicleId(), t.getTransferNodeId());
-            double receiverTime = getArrivalTimeAtNode(t.getReceivingVehicleId(), t.getTransferNodeId());
-            double gap = Math.abs(giverTime - receiverTime);
+            try {
+                Route giverRoute = getRouteByVehicleId(t.getGivingVehicleId());
+                Route receiverRoute = getRouteByVehicleId(t.getReceivingVehicleId());
 
-            if (gap > instance.getSyncWindow() + 1e-6) {
-                report.addViolation(String.format(
-                        "Sync violated at node %d: giver(v%d)=%.1f, receiver(v%d)=%.1f, gap=%.1f > W=%.1f",
-                        t.getTransferNodeId(), t.getGivingVehicleId(), giverTime,
-                        t.getReceivingVehicleId(), receiverTime, gap, instance.getSyncWindow()));
+                // Check that both vehicles still visit the transfer node
+                if (!giverRoute.visitsNode(t.getTransferNodeId())) {
+                    report.addViolation(String.format(
+                            "Stale transfer: giver v%d no longer visits node %d",
+                            t.getGivingVehicleId(), t.getTransferNodeId()));
+                    continue;
+                }
+                if (!receiverRoute.visitsNode(t.getTransferNodeId())) {
+                    report.addViolation(String.format(
+                            "Stale transfer: receiver v%d no longer visits node %d",
+                            t.getReceivingVehicleId(), t.getTransferNodeId()));
+                    continue;
+                }
+
+                double giverTime = giverRoute.getArrivalTimeAtNode(t.getTransferNodeId());
+                double receiverTime = receiverRoute.getArrivalTimeAtNode(t.getTransferNodeId());
+
+                // Constraint (17): u_j,k1 - u_j,k2 ≤ W
+                // DIRECTIONAL: giver can arrive before receiver (goods wait at node),
+                // but receiver should not wait more than W for the giver to arrive.
+                // giverTime - receiverTime ≤ W
+                double syncGap = giverTime - receiverTime;
+
+                if (syncGap > instance.getSyncWindow() + 1e-6) {
+                    report.addViolation(String.format(
+                            "Sync violated at node %d: giver(v%d)=%.1f arrives %.1f after receiver(v%d)=%.1f, exceeds W=%.1f",
+                            t.getTransferNodeId(), t.getGivingVehicleId(), giverTime,
+                            syncGap, t.getReceivingVehicleId(), receiverTime, instance.getSyncWindow()));
+                }
+            } catch (Exception e) {
+                report.addViolation("Transfer check error at node " + t.getTransferNodeId()
+                        + ": " + e.getMessage());
             }
         }
 
@@ -225,10 +248,59 @@ public class Solution {
     public void addTransfer(Transfer t)  { transfers.add(t); }
     public void removeTransfer(Transfer t) { transfers.remove(t); }
 
+    /**
+     * Removes any Transfer objects that reference nodes no longer present
+     * in the corresponding vehicle's route. Also reverts any orphaned
+     * pickup/dropoff stops to serve-only (or removes them if transfer-only).
+     *
+     * Must be called after any destroy/repair operation that may have
+     * altered routes containing transfer nodes.
+     */
+    public void cleanupStaleTransfers() {
+        // 1. Remove Transfer objects where giver or receiver no longer visits the node
+        java.util.Iterator<Transfer> it = transfers.iterator();
+        java.util.Set<Integer> validTransferNodes = new java.util.HashSet<>();
+
+        while (it.hasNext()) {
+            Transfer t = it.next();
+            Route giverRoute = getRouteByVehicleId(t.getGivingVehicleId());
+            Route receiverRoute = getRouteByVehicleId(t.getReceivingVehicleId());
+
+            boolean giverOk = giverRoute.visitsNode(t.getTransferNodeId());
+            boolean receiverOk = receiverRoute.visitsNode(t.getTransferNodeId());
+
+            if (giverOk && receiverOk) {
+                validTransferNodes.add(t.getTransferNodeId());
+            } else {
+                it.remove();
+            }
+        }
+
+        // 2. Clean up orphaned pickup/dropoff stops in all routes
+        for (Route r : routes) {
+            boolean changed = false;
+            for (int i = r.getStops().size() - 1; i >= 0; i--) {
+                RouteStop stop = r.getStops().get(i);
+                int nodeId = stop.getNode().getId();
+
+                if (stop.isTransferOnly() && !validTransferNodes.contains(nodeId)) {
+                    // Transfer-only stop with no valid transfer → remove
+                    r.removeStop(i);
+                    changed = true;
+                } else if (stop.isServed() && (stop.isPickup() || stop.isDropoff())
+                        && !validTransferNodes.contains(nodeId)) {
+                    // Served + transfer action, but transfer is gone → revert to serve-only
+                    r.getStops().set(i, RouteStop.serve(stop.getNode()));
+                    changed = true;
+                }
+            }
+            if (changed) r.evaluate();
+        }
+    }
+
     public List<Route> getRoutes()       { return routes; }
     public List<Transfer> getTransfers() { return transfers; }
     public Instance getInstance()        { return instance; }
-    public double getAlpha()             { return alpha; }
 
     // ──────────────────────────── Display ────────────────────────────────────
 
@@ -254,7 +326,6 @@ public class Solution {
         sb.append(String.format("  Served: %d / %d customers\n", getNumServed(), getNumCustomers()));
         sb.append(String.format("  Profit: %.2f\n", getTotalProfit()));
         sb.append(String.format("  Distance: %.2f\n", getTotalDistance()));
-        sb.append(String.format("  Objective (α=%.3f): %.2f\n", alpha, getObjectiveValue()));
         sb.append(String.format("  Transfers: %d\n", transfers.size()));
         sb.append(String.format("  Feasible: %s\n", isFeasible()));
         sb.append("╚══════════════════════════════════════════╝");

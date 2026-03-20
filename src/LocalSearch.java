@@ -22,11 +22,9 @@ import java.util.List;
  */
 public class LocalSearch {
 
-    private final double objectiveAlpha;
     private int totalImprovements;
 
-    public LocalSearch(double objectiveAlpha) {
-        this.objectiveAlpha = objectiveAlpha;
+    public LocalSearch() {
         this.totalImprovements = 0;
     }
 
@@ -458,9 +456,8 @@ public class LocalSearch {
                     for (int pos = 0; pos <= route.size(); pos++) {
                         RouteStop newStop = RouteStop.serve(node);
                         if (route.canInsert(pos, newStop)) {
-                            // Score: profit gained minus α × extra distance
-                            double extraDist = computeInsertionCost(route, pos, node);
-                            double score = node.getProfit() - objectiveAlpha * extraDist;
+                            // Score: profit of the new customer
+                            double score = node.getProfit();
 
                             if (score > bestScore) {
                                 bestScore = score;
@@ -488,14 +485,13 @@ public class LocalSearch {
     // UTILITY METHODS
     // ══════════════════════════════════════════════════════════
 
-    /** Compute solution objective: Σ profit - α × Σ distance */
+    /** Compute solution objective: Σ profit */
     private double computeObjective(Solution solution) {
-        double profit = 0, dist = 0;
+        double profit = 0;
         for (Route r : solution.getRoutes()) {
             profit += r.getTotalProfit();
-            dist += r.getTotalDistance();
         }
-        return profit - objectiveAlpha * dist;
+        return profit;
     }
 
     /** Compute the extra distance from inserting a node at a given position */

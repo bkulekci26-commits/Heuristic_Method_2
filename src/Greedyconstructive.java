@@ -35,27 +35,23 @@ public class GreedyConstructive {
     private final double betaWeight;    // distance penalty importance
     private final double gammaWeight;   // capacity consumption importance
 
-    private final double objectiveAlpha; // α in the objective function (distance penalty)
-
     // ──────────────────────────── Constructor ────────────────────────────────
 
     /**
      * @param alphaWeight   profit exponent (higher = favor high-profit nodes)
      * @param betaWeight    distance exponent (higher = penalize detours more)
      * @param gammaWeight   capacity exponent (higher = penalize heavy demands)
-     * @param objectiveAlpha  the α coefficient in the objective function
      */
     public GreedyConstructive(double alphaWeight, double betaWeight,
-                              double gammaWeight, double objectiveAlpha) {
+                              double gammaWeight) {
         this.alphaWeight = alphaWeight;
         this.betaWeight = betaWeight;
         this.gammaWeight = gammaWeight;
-        this.objectiveAlpha = objectiveAlpha;
     }
 
     /** Default constructor with balanced weights */
-    public GreedyConstructive(double objectiveAlpha) {
-        this(1.0, 1.0, 0.5, objectiveAlpha);
+    public GreedyConstructive() {
+        this(1.0, 1.0, 0.5);
     }
 
     // ──────────────────────────── Main Algorithm ─────────────────────────────
@@ -74,7 +70,7 @@ public class GreedyConstructive {
      *   4. Return the solution
      */
     public Solution construct(Instance instance) {
-        Solution solution = new Solution(instance, objectiveAlpha);
+        Solution solution = new Solution(instance);
 
         // Step 1: Initialize empty routes
         for (int k = 0; k < instance.getMaxVehicles(); k++) {
@@ -153,8 +149,8 @@ public class GreedyConstructive {
 
         System.out.printf("[Constructive] DONE: %d nodes served out of %d candidates%n",
                 insertionCount, candidates.size());
-        System.out.printf("[Constructive] Profit=%.1f, Distance=%.1f, Objective=%.2f%n",
-                solution.getTotalProfit(), solution.getTotalDistance(), solution.getObjectiveValue());
+        System.out.printf("[Constructive] Profit=%.1f, Distance=%.1f%n",
+                solution.getTotalProfit(), solution.getTotalDistance());
 
         return solution;
     }

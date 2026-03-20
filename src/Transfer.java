@@ -5,7 +5,7 @@
  * and the receiving vehicle (k2) picks it up.
  *
  * Constraint (10): Σ_k qpick_jk = Σ_k qdrop_jk   (conservation at each node)
- * Constraint (17): |u_j,k1 - u_j,k2| ≤ W          (synchronization window)
+ * Constraint (17): u_j,k1 - u_j,k2 ≤ W  (directional synchronization)
  */
 public class Transfer {
 
