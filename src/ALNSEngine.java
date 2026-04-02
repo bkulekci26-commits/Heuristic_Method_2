@@ -40,7 +40,6 @@ public class ALNSEngine {
     private final DestroyOperators destroyOps;
     private final RepairOperators repairOps;
     private final LocalSearch localSearch;
-    private final TransferOptimizer transferOptimizer;
     private final Random rng;
 
     // ── Adaptive weights ──
@@ -82,7 +81,6 @@ public class ALNSEngine {
         this.destroyOps = new DestroyOperators(rng);
         this.repairOps = new RepairOperators(rng);
         this.localSearch = new LocalSearch();
-        this.transferOptimizer = new TransferOptimizer();
 
         initWeights();
     }
@@ -128,10 +126,7 @@ public class ALNSEngine {
         Solution admissibleSol = new Solution(currentSol);
         double bestProfit = bestSol.getTotalProfit();
 
-        // ── Separate transfer solution pool ──
-        // Tracks the best feasible solution that contains transfers.
-        // ALNS destroy/repair cycles erase transfers, so without this pool,
-        // good transfer solutions found mid-search are lost forever.
+        // Transfer solution pool — filled only by TPO-MIP after ALNS completes
         Solution bestTransferSol = null;
         double bestTransferProfit = 0;
 
@@ -152,7 +147,6 @@ public class ALNSEngine {
         // ── Phase 2: ALNS iterations ──
         int iterWithoutImprovement = 0;
         int maxNoImprove = maxIterations / 3;
-        int transferInterval = Math.max(200, maxIterations / 25); // periodic transfer attempts
 
         acceptedCount = 0;
         newBestCount = 0;
@@ -228,20 +222,6 @@ public class ALNSEngine {
 
                 // Check if new global best
                 if (candProfit > bestProfit) {
-                    // Apply transfer optimization on new best
-                    Solution preTransfer = new Solution(admissibleSol);
-                    transferOptimizer.optimize(admissibleSol);
-                    localSearch.postInsert(admissibleSol);
-                    localSearch.improve(admissibleSol);
-                    localSearch.postInsert(admissibleSol);
-
-                    // Verify feasibility — rollback transfers if broken
-                    if (!admissibleSol.isFeasible()) {
-                        admissibleSol = preTransfer;
-                    }
-
-                    candProfit = admissibleSol.getTotalProfit();
-
                     bestSol = new Solution(admissibleSol);
                     bestProfit = candProfit;
                     newBestCount++;
@@ -256,56 +236,11 @@ public class ALNSEngine {
                             destroyOps.getOperatorName(dOp),
                             repairOps.getOperatorName(rOp),
                             beta, temperature);
-
-                    // Save to transfer pool if solution has transfers
-                    if (!admissibleSol.getTransfers().isEmpty()
-                            && admissibleSol.isFeasible()
-                            && admissibleSol.getTotalProfit() > bestTransferProfit) {
-                        bestTransferSol = new Solution(admissibleSol);
-                        bestTransferProfit = admissibleSol.getTotalProfit();
-                        System.out.printf("[ALNS] iter %5d | TRANSFER POOL updated: profit=%.0f transfers=%d%n",
-                                iter, bestTransferProfit, bestTransferSol.getTransfers().size());
-                    }
                 } else {
                     iterWithoutImprovement++;
                 }
             } else {
                 iterWithoutImprovement++;
-            }
-
-            // ── Periodic transfer attempt on admissible solution ──
-            if (iter > 0 && iter % transferInterval == 0) {
-                Solution transferTest = new Solution(admissibleSol);
-                int tCount = transferOptimizer.optimize(transferTest);
-                if (tCount > 0 && transferTest.isFeasible()) {
-                    localSearch.postInsert(transferTest);
-                    localSearch.improve(transferTest);
-                    localSearch.postInsert(transferTest);
-                    if (transferTest.isFeasible()) {
-                        double tProfit = transferTest.getTotalProfit();
-
-                        // Save to transfer pool regardless of admissible comparison
-                        if (!transferTest.getTransfers().isEmpty()
-                                && tProfit > bestTransferProfit) {
-                            bestTransferSol = new Solution(transferTest);
-                            bestTransferProfit = tProfit;
-                            System.out.printf("[ALNS] iter %5d | TRANSFER POOL updated: profit=%.0f transfers=%d (periodic)%n",
-                                    iter, bestTransferProfit, bestTransferSol.getTransfers().size());
-                        }
-
-                        if (tProfit > admissibleSol.getTotalProfit()) {
-                            admissibleSol = transferTest;
-                            if (tProfit > bestProfit) {
-                                bestSol = new Solution(transferTest);
-                                bestProfit = tProfit;
-                                newBestCount++;
-                                iterWithoutImprovement = 0;
-                                System.out.printf("[ALNS] iter %5d | NEW BEST profit=%.0f served=%d (periodic transfer)%n",
-                                        iter, bestProfit, bestSol.getNumServed());
-                            }
-                        }
-                    }
-                }
             }
 
             // ── Temperature cooling ──
@@ -333,29 +268,31 @@ public class ALNSEngine {
             TransferMIP transferMIP = new TransferMIP();
             int mipNewCustomers = transferMIP.optimize(mipTransferSol);
 
-            // Check if MIP improved the solution (new customers OR transfers)
-            if (mipTransferSol.isFeasible()
-                    && mipTransferSol.getTotalProfit() > bestSol.getTotalProfit()) {
-                // DO NOT run LocalSearch here — it destroys transfer structures
+            // Debug: print feasibility status
+            Solution.FeasibilityReport fr = mipTransferSol.checkFeasibility();
+            double mipProfit = mipTransferSol.getTotalProfit();
+            System.out.printf("[ALNS] TPO-MIP result: profit=%.0f (was %.0f), feasible=%s, transfers=%d%n",
+                    mipProfit, bestSol.getTotalProfit(), fr.isFeasible(), mipTransferSol.getTransfers().size());
+            if (!fr.isFeasible()) {
+                System.out.println("[ALNS] TPO-MIP infeasibility reasons:");
+                for (String v : fr.getViolations())
+                    System.out.println("  → " + v);
+            }
+
+            if (fr.isFeasible() && mipProfit > bestSol.getTotalProfit()) {
+                // DO NOT run LocalSearch — it destroys transfer structures
                 bestTransferSol = new Solution(mipTransferSol);
-                bestTransferProfit = mipTransferSol.getTotalProfit();
+                bestTransferProfit = mipProfit;
                 System.out.printf("[ALNS] TPO-MIP POOL: profit=%.0f transfers=%d customers_added=%d%n",
                         bestTransferProfit, bestTransferSol.getTransfers().size(), mipNewCustomers);
+            } else if (!fr.isFeasible()) {
+                System.out.println("[ALNS] TPO-MIP: solution infeasible after application");
             } else {
-                System.out.println("[ALNS] TPO-MIP: no profitable transfers found");
+                System.out.println("[ALNS] TPO-MIP: no profit improvement");
             }
         } catch (Exception e) {
             System.out.println("[ALNS] TPO-MIP failed: " + e.getMessage());
-            // Fall back to heuristic transfer optimizer
-            Solution heuristicTransferSol = new Solution(bestSol);
-            transferOptimizer.optimize(heuristicTransferSol);
-            localSearch.postInsert(heuristicTransferSol);
-            if (heuristicTransferSol.isFeasible()
-                    && !heuristicTransferSol.getTransfers().isEmpty()
-                    && heuristicTransferSol.getTotalProfit() > bestTransferProfit) {
-                bestTransferSol = new Solution(heuristicTransferSol);
-                bestTransferProfit = heuristicTransferSol.getTotalProfit();
-            }
+            e.printStackTrace();
         }
 
         // ── Phase 5: Pool comparison — return the best overall ──
