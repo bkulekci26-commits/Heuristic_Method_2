@@ -43,7 +43,7 @@ public class Solution {
         this.transfers = new ArrayList<>(other.transfers);
     }
 
-    /** Restore this solution's state from another solution (for rollback) */
+    /** Restore this solution's state from another (for rollback) */
     public void restoreFrom(Solution other) {
         this.routes.clear();
         for (Route r : other.routes) {

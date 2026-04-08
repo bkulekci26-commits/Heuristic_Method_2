@@ -2,36 +2,22 @@ import com.gurobi.gurobi.*;
 import java.util.*;
 
 /**
- * Transfer Post-Optimization MIP v5 for CTOP-T-Sync.
+ * Transfer Post-Optimization MIP v6 for CTOP-T-Sync.
  *
- * Move Selection Model: every candidate (remove+insert) is pre-tested on
- * actual route copies. The MIP selects the best non-conflicting subset.
+ * Design: MIP PLANS globally, Routes VALIDATE locally.
  *
- * Zero model-reality gap: if the MIP selects it, it's guaranteed feasible.
+ * The MIP maximizes net profit by deciding:
+ *   - Which served nodes to remove (frees capacity)
+ *   - Which unserved nodes to insert (gains profit)
+ *   - How to share demand across vehicles (transfers)
  *
- * Candidate types:
- *   A) Same-vehicle swap:  remove s from k, insert u in k
- *   B) Transfer swap:      remove s from k1, transfer to k2, insert u in k2
+ * KEY: No time constraint in MIP. Time feasibility is checked
+ * by inserting into actual Route copies post-solve.
+ * This eliminates the additive time approximation that broke v1-v5.
  */
 public class TransferMIP {
 
     private static final double EPS = 1e-4;
-
-    /** A pre-validated candidate move */
-    static class Candidate {
-        int removeNode;   // node to remove (-1 if none)
-        int removeVehicle;// vehicle to remove from
-        int insertNode;   // node to insert
-        int insertVehicle;// vehicle to insert into
-        int transferNode; // transfer point (-1 if same-vehicle swap)
-        double netProfit; // profit_insert - profit_remove
-        boolean isTransfer;
-
-        Candidate(int rn, int rv, int in_, int iv, int tn, double np, boolean t) {
-            removeNode = rn; removeVehicle = rv; insertNode = in_;
-            insertVehicle = iv; transferNode = tn; netProfit = np; isTransfer = t;
-        }
-    }
 
     public int optimize(Solution solution) {
         Instance inst = solution.getInstance();
@@ -40,145 +26,37 @@ public class TransferMIP {
 
         int K = routes.size();
         double Q = inst.getMaxCapacity();
-        double Tmax = inst.getMaxRouteDuration();
         double W = inst.getSyncWindow();
 
+        // ── Served nodes ──
+        List<int[]> served = new ArrayList<>();
+        List<Double> servedProfit = new ArrayList<>();
+        List<Double> servedDemand = new ArrayList<>();
+        for (int k = 0; k < K; k++) {
+            Route route = routes.get(k);
+            for (int s = 0; s < route.size(); s++) {
+                RouteStop stop = route.getStops().get(s);
+                if (stop.isServed()) {
+                    served.add(new int[]{k, s, stop.getNode().getId()});
+                    servedProfit.add(stop.getNode().getProfit());
+                    servedDemand.add(stop.getNode().getDemand());
+                }
+            }
+        }
+        int S = served.size();
+
+        // ── Unserved nodes ──
         List<Node> unserved = solution.getUnservedNodes();
-        if (unserved.isEmpty()) return 0;
+        int U = unserved.size();
+        if (S == 0 || U == 0) return 0;
 
-        // ── Collect served nodes ──
-        List<int[]> served = new ArrayList<>(); // [vehicleIdx, nodeId]
-        for (int k = 0; k < K; k++)
-            for (RouteStop s : routes.get(k).getStops())
-                if (s.isServed()) served.add(new int[]{k, s.getNode().getId()});
-
-        System.out.printf("[TPO-MIP] K=%d served=%d unserved=%d%n", K, served.size(), unserved.size());
+        System.out.printf("[TPO-MIP] K=%d S=%d U=%d%n", K, S, U);
         for (int k = 0; k < K; k++)
             System.out.printf("[TPO-MIP]   v%d: load=%.0f/%.0f time=%.1f/%.1f%n",
-                    k, routes.get(k).getInitialLoad(), Q, routes.get(k).getTotalTime(), Tmax);
+                    k, routes.get(k).getInitialLoad(), Q,
+                    routes.get(k).getTotalTime(), inst.getMaxRouteDuration());
 
-        // ══════════════════════════════════════════
-        //  PHASE 1: Enumerate pre-validated candidates
-        // ══════════════════════════════════════════
-        List<Candidate> candidates = new ArrayList<>();
-
-        // ── Type A: Same-vehicle swap (remove s, insert u in same vehicle k) ──
-        for (int[] sv : served) {
-            int k = sv[0];
-            int sId = sv[1];
-            Node sNode = inst.getNodeById(sId);
-
-            Route copy = new Route(routes.get(k));
-            int sIdx = copy.findStopIndex(sId);
-            if (sIdx < 0) continue;
-            copy.removeStop(sIdx);
-            copy.evaluate();
-
-            for (Node u : unserved) {
-                // Try all positions, pick best feasible
-                int bestPos = -1;
-                double bestDet = Double.MAX_VALUE;
-                for (int p = 0; p <= copy.size(); p++) {
-                    copy.insertStop(p, RouteStop.serve(u));
-                    copy.evaluate();
-                    if (copy.isFeasible()) {
-                        double det = copy.getTotalTime() - (routes.get(k).getTotalTime());
-                        if (det < bestDet) { bestDet = det; bestPos = p; }
-                    }
-                    copy.removeStop(p);
-                    copy.evaluate();
-                }
-
-                if (bestPos >= 0) {
-                    double net = u.getProfit() - sNode.getProfit();
-                    if (net > 0) {
-                        candidates.add(new Candidate(sId, k, u.getId(), k, -1, net, false));
-                    }
-                }
-            }
-        }
-
-        // ── Type B: Transfer swap (remove s from k1, k2 inserts u via transfer) ──
-        for (int[] sv : served) {
-            int k1 = sv[0];
-            int sId = sv[1];
-            Node sNode = inst.getNodeById(sId);
-
-            Route copy1 = new Route(routes.get(k1));
-            int sIdx = copy1.findStopIndex(sId);
-            if (sIdx < 0) continue;
-            copy1.removeStop(sIdx);
-            copy1.evaluate();
-
-            double freedDemand = sNode.getDemand();
-
-            // Find transfer points: nodes in k1's (modified) route
-            for (RouteStop tStop : copy1.getStops()) {
-                Node tNode = tStop.getNode();
-                double dropperArrival = copy1.getArrivalTimeAtNode(tNode.getId());
-
-                for (int k2 = 0; k2 < K; k2++) {
-                    if (k2 == k1) continue;
-                    Route copy2 = new Route(routes.get(k2));
-
-                    // k2 detours to tNode for pickup
-                    int pickPos = findBestPickupPos(copy2, tNode, freedDemand, inst);
-                    if (pickPos < 0) continue;
-
-                    copy2.insertStop(pickPos, RouteStop.pickup(tNode, freedDemand));
-                    copy2.evaluate();
-
-                    if (!copy2.isFeasible()) continue;
-
-                    // Check sync: dropper arrival - picker arrival ≤ W
-                    double pickerArrival = copy2.getArrivalTimeAtNode(tNode.getId());
-                    if (dropperArrival - pickerArrival > W + EPS) continue;
-
-                    // Now try inserting each unserved customer in k2
-                    for (Node u : unserved) {
-                        int bestPos = -1;
-                        for (int p = 0; p <= copy2.size(); p++) {
-                            copy2.insertStop(p, RouteStop.serve(u));
-                            copy2.evaluate();
-                            if (copy2.isFeasible()) { bestPos = p; break; }
-                            copy2.removeStop(p);
-                            copy2.evaluate();
-                        }
-
-                        if (bestPos >= 0) {
-                            double net = u.getProfit() - sNode.getProfit();
-                            if (net > 0) {
-                                candidates.add(new Candidate(sId, k1, u.getId(), k2,
-                                        tNode.getId(), net, true));
-                            }
-                            // Remove u to test next one
-                            copy2.removeStop(copy2.findStopIndex(u.getId()));
-                            copy2.evaluate();
-                        }
-                    }
-
-                    // Remove pickup to test next transfer point
-                    copy2.removeStop(copy2.findStopIndex(tNode.getId()));
-                    copy2.evaluate();
-                }
-            }
-        }
-
-        System.out.printf("[TPO-MIP] Candidates: %d same-vehicle, %d transfer%n",
-                (int) candidates.stream().filter(c -> !c.isTransfer).count(),
-                (int) candidates.stream().filter(c -> c.isTransfer).count());
-
-        if (candidates.isEmpty()) {
-            System.out.println("[TPO-MIP] No profitable candidates found");
-            return 0;
-        }
-
-        // ══════════════════════════════════════════
-        //  PHASE 2: MIP to select best non-conflicting candidates
-        // ══════════════════════════════════════════
-        int C = candidates.size();
         int result = 0;
-
         try {
             GRBEnv env = new GRBEnv(true);
             env.set(GRB.IntParam.LogToConsole, 0);
@@ -187,141 +65,128 @@ public class TransferMIP {
             GRBModel model = new GRBModel(env);
             model.set(GRB.IntAttr.ModelSense, GRB.MAXIMIZE);
 
-            GRBVar[] x = new GRBVar[C];
-            for (int c = 0; c < C; c++)
-                x[c] = model.addVar(0, 1, candidates.get(c).netProfit, GRB.BINARY, "x" + c);
+            // ═══ VARIABLES ═══
+            GRBVar[] rm = new GRBVar[S];
+            for (int si = 0; si < S; si++)
+                rm[si] = model.addVar(0, 1, 0, GRB.BINARY, "rm" + si);
 
-            // Each served node removed at most once
-            Map<Integer, List<Integer>> removeMap = new HashMap<>();
-            for (int c = 0; c < C; c++) {
-                int rn = candidates.get(c).removeNode;
-                removeMap.computeIfAbsent(rn, k -> new ArrayList<>()).add(c);
-            }
-            for (var entry : removeMap.entrySet()) {
+            GRBVar[][] ins = new GRBVar[U][K];
+            for (int ui = 0; ui < U; ui++)
+                for (int k = 0; k < K; k++)
+                    ins[ui][k] = model.addVar(0, 1, 0, GRB.BINARY, "ins" + ui + "_" + k);
+
+            GRBVar[][] share = new GRBVar[S][K];
+            for (int si = 0; si < S; si++)
+                for (int k = 0; k < K; k++)
+                    share[si][k] = model.addVar(0, servedDemand.get(si), 0, GRB.CONTINUOUS, "sh" + si + "_" + k);
+
+            // ═══ OBJECTIVE: max net profit ═══
+            GRBLinExpr obj = new GRBLinExpr();
+            for (int ui = 0; ui < U; ui++)
+                for (int k = 0; k < K; k++)
+                    obj.addTerm(unserved.get(ui).getProfit(), ins[ui][k]);
+            for (int si = 0; si < S; si++)
+                obj.addTerm(-servedProfit.get(si), rm[si]);
+            model.setObjective(obj, GRB.MAXIMIZE);
+
+            // ═══ CONSTRAINTS ═══
+
+            // (C1) Each unserved node inserted at most once
+            for (int ui = 0; ui < U; ui++) {
                 GRBLinExpr e = new GRBLinExpr();
-                for (int c : entry.getValue()) e.addTerm(1, x[c]);
-                model.addConstr(e, GRB.LESS_EQUAL, 1, "rm_" + entry.getKey());
+                for (int k = 0; k < K; k++) e.addTerm(1, ins[ui][k]);
+                model.addConstr(e, GRB.LESS_EQUAL, 1, "insOnce" + ui);
             }
 
-            // Each unserved node inserted at most once
-            Map<Integer, List<Integer>> insertMap = new HashMap<>();
-            for (int c = 0; c < C; c++) {
-                int in_ = candidates.get(c).insertNode;
-                insertMap.computeIfAbsent(in_, k -> new ArrayList<>()).add(c);
-            }
-            for (var entry : insertMap.entrySet()) {
-                GRBLinExpr e = new GRBLinExpr();
-                for (int c : entry.getValue()) e.addTerm(1, x[c]);
-                model.addConstr(e, GRB.LESS_EQUAL, 1, "ins_" + entry.getKey());
+            // (C2) Demand sharing: Σ_k share[s][k] = demand(s) × (1 - rm[s])
+            for (int si = 0; si < S; si++) {
+                GRBLinExpr lhs = new GRBLinExpr();
+                for (int k = 0; k < K; k++) lhs.addTerm(1, share[si][k]);
+                GRBLinExpr rhs = new GRBLinExpr();
+                rhs.addConstant(servedDemand.get(si));
+                rhs.addTerm(-servedDemand.get(si), rm[si]);
+                model.addConstr(lhs, GRB.EQUAL, rhs, "dem" + si);
             }
 
-            // At most 1 removal per vehicle
+            // (C3) Capacity: Σ share[s][k] + Σ demand(u)·ins[u][k] ≤ Q
             for (int k = 0; k < K; k++) {
                 GRBLinExpr e = new GRBLinExpr();
-                for (int c = 0; c < C; c++)
-                    if (candidates.get(c).removeVehicle == k) e.addTerm(1, x[c]);
-                model.addConstr(e, GRB.LESS_EQUAL, 1, "maxRmV" + k);
+                for (int si = 0; si < S; si++) e.addTerm(1, share[si][k]);
+                for (int ui = 0; ui < U; ui++)
+                    e.addTerm(unserved.get(ui).getDemand(), ins[ui][k]);
+                model.addConstr(e, GRB.LESS_EQUAL, Q, "cap" + k);
             }
 
-            // At most 1 insertion per vehicle
+            // (C4) Net profit ≥ 1
+            model.addConstr(obj, GRB.GREATER_EQUAL, 1, "netPos");
+
+            // (C5) Limit removals per vehicle
             for (int k = 0; k < K; k++) {
                 GRBLinExpr e = new GRBLinExpr();
-                for (int c = 0; c < C; c++)
-                    if (candidates.get(c).insertVehicle == k) e.addTerm(1, x[c]);
-                model.addConstr(e, GRB.LESS_EQUAL, 1, "maxInsV" + k);
+                for (int si = 0; si < S; si++)
+                    if (served.get(si)[0] == k) e.addTerm(1, rm[si]);
+                model.addConstr(e, GRB.LESS_EQUAL, 2, "maxRm" + k);
             }
 
+            // (C6) Limit insertions per vehicle
+            for (int k = 0; k < K; k++) {
+                GRBLinExpr e = new GRBLinExpr();
+                for (int ui = 0; ui < U; ui++) e.addTerm(1, ins[ui][k]);
+                model.addConstr(e, GRB.LESS_EQUAL, 2, "maxIns" + k);
+            }
+
+            // NO time constraint — validated post-hoc
+            // NO sync constraint — validated post-hoc
+
+            // ═══ SOLVE ═══
             model.optimize();
 
-            if (model.get(GRB.IntAttr.Status) == GRB.OPTIMAL ||
-                    model.get(GRB.IntAttr.Status) == GRB.SUBOPTIMAL) {
+            int status = model.get(GRB.IntAttr.Status);
+            if (status == GRB.OPTIMAL || status == GRB.SUBOPTIMAL) {
+                double objVal = model.get(GRB.DoubleAttr.ObjVal);
+                System.out.printf("[TPO-MIP] MIP objective: +%.0f%n", objVal);
 
-                double obj = model.get(GRB.DoubleAttr.ObjVal);
-                if (obj < EPS) {
-                    System.out.println("[TPO-MIP] No profitable selection");
-                } else {
-                    // ══════════════════════════════════════════
-                    //  PHASE 3: Apply selected candidates
-                    // ══════════════════════════════════════════
-                    Solution backup = new Solution(solution);
-
-                    for (int c = 0; c < C; c++) {
-                        if (x[c].get(GRB.DoubleAttr.X) < 0.5) continue;
-                        Candidate cand = candidates.get(c);
-
-                        System.out.printf("[TPO-MIP] Selected: remove %d from v%d, insert %d in v%d%s (net=+%.0f)%n",
-                                cand.removeNode, cand.removeVehicle,
-                                cand.insertNode, cand.insertVehicle,
-                                cand.isTransfer ? " [TRANSFER via " + cand.transferNode + "]" : "",
-                                cand.netProfit);
-
-                        // Remove
-                        Route rmRoute = solution.getRoutes().get(cand.removeVehicle);
-                        int rmIdx = rmRoute.findStopIndex(cand.removeNode);
-                        if (rmIdx >= 0) { rmRoute.removeStop(rmIdx); rmRoute.evaluate(); }
-
-                        if (cand.isTransfer) {
-                            // Add dropoff at transfer node in remover's route
-                            Node tNode = inst.getNodeById(cand.transferNode);
-                            Node sNode = inst.getNodeById(cand.removeNode);
-                            double qty = sNode.getDemand();
-
-                            int tIdx = rmRoute.findStopIndex(cand.transferNode);
-                            if (tIdx >= 0) {
-                                RouteStop old = rmRoute.getStops().get(tIdx);
-                                double ed = old.isDropoff() ? old.getDropoffQty() : 0;
-                                rmRoute.getStops().set(tIdx, old.isServed()
-                                        ? RouteStop.serveAndDropoff(tNode, ed + qty)
-                                        : RouteStop.dropoff(tNode, ed + qty));
-                                rmRoute.evaluate();
-                            }
-
-                            // Add pickup in inserter's route
-                            Route insRoute = solution.getRoutes().get(cand.insertVehicle);
-                            int pickPos = findBestPickupPos(insRoute, tNode, qty, inst);
-                            if (pickPos >= 0) {
-                                insRoute.insertStop(pickPos, RouteStop.pickup(tNode, qty));
-                                insRoute.evaluate();
-                            }
-
-                            solution.addTransfer(new Transfer(cand.transferNode,
-                                    rmRoute.getVehicleId(), insRoute.getVehicleId(), qty));
-                        }
-
-                        // Insert new customer
-                        Route insRoute = solution.getRoutes().get(cand.insertVehicle);
-                        Node uNode = inst.getNodeById(cand.insertNode);
-                        int bestPos = findBestServePos(insRoute, uNode, inst);
-                        if (bestPos >= 0) {
-                            insRoute.insertStop(bestPos, RouteStop.serve(uNode));
-                            insRoute.evaluate();
-                            result++;
-                        }
+                // Extract solution
+                List<int[]> removals = new ArrayList<>();
+                for (int si = 0; si < S; si++)
+                    if (rm[si].get(GRB.DoubleAttr.X) > 0.5) {
+                        removals.add(new int[]{served.get(si)[0], served.get(si)[2]});
+                        System.out.printf("[TPO-MIP] Plan: remove node %d (p=%.0f) from v%d%n",
+                                served.get(si)[2], servedProfit.get(si), served.get(si)[0]);
                     }
 
-                    for (Route r : solution.getRoutes()) r.evaluate();
-
-                    // Validate
-                    if (!solution.isFeasible() ||
-                            solution.getTotalProfit() <= backup.getTotalProfit()) {
-
-                        if (!solution.isFeasible()) {
-                            Solution.FeasibilityReport fr = solution.checkFeasibility();
-                            System.out.println("[TPO-MIP] Post-apply infeasible:");
-                            for (String v : fr.getViolations()) System.out.println("  → " + v);
+                List<int[]> insertions = new ArrayList<>();
+                for (int ui = 0; ui < U; ui++)
+                    for (int k = 0; k < K; k++)
+                        if (ins[ui][k].get(GRB.DoubleAttr.X) > 0.5) {
+                            insertions.add(new int[]{ui, k});
+                            System.out.printf("[TPO-MIP] Plan: insert node %d (p=%.0f) in v%d%n",
+                                    unserved.get(ui).getId(), unserved.get(ui).getProfit(), k);
                         }
-                        System.out.printf("[TPO-MIP] Rollback (profit %.0f ≤ %.0f)%n",
-                                solution.getTotalProfit(), backup.getTotalProfit());
-                        solution.restoreFrom(backup);
-                        result = 0;
-                    } else {
-                        System.out.printf("[TPO-MIP] SUCCESS: profit %.0f → %.0f (+%.0f), transfers=%d%n",
-                                backup.getTotalProfit(), solution.getTotalProfit(),
-                                solution.getTotalProfit() - backup.getTotalProfit(),
-                                solution.getTransfers().size());
+
+                List<double[]> shareOps = new ArrayList<>();
+                for (int si = 0; si < S; si++) {
+                    if (rm[si].get(GRB.DoubleAttr.X) > 0.5) continue;
+                    int origK = served.get(si)[0];
+                    for (int k = 0; k < K; k++) {
+                        if (k == origK) continue;
+                        double val = share[si][k].get(GRB.DoubleAttr.X);
+                        if (val > EPS) {
+                            shareOps.add(new double[]{si, origK, k, val});
+                            System.out.printf("[TPO-MIP] Plan: share node %d → v%d delivers %.0f%n",
+                                    served.get(si)[2], k, val);
+                        }
                     }
                 }
+
+                // ═══ POST-MIP: Apply on actual routes ═══
+                result = applyMipSolution(solution, inst, routes, served, unserved,
+                        removals, insertions, shareOps, W);
+
+            } else if (status == GRB.INFEASIBLE) {
+                System.out.println("[TPO-MIP] Infeasible");
             }
+
             model.dispose();
             env.dispose();
         } catch (GRBException e) {
@@ -330,34 +195,131 @@ public class TransferMIP {
         return result;
     }
 
-    /** Find best position to insert a serve stop, checking feasibility */
-    private int findBestServePos(Route route, Node node, Instance inst) {
-        double bestDet = Double.MAX_VALUE;
-        int bestP = -1;
-        for (int p = 0; p <= route.size(); p++) {
-            route.insertStop(p, RouteStop.serve(node));
-            route.evaluate();
-            if (route.isFeasible()) {
-                double det = route.getTotalTime();
-                if (det < bestDet) { bestDet = det; bestP = p; }
-            }
-            route.removeStop(p);
-            route.evaluate();
+    /**
+     * Apply MIP solution on actual routes with step-by-step validation.
+     */
+    private int applyMipSolution(Solution solution, Instance inst, List<Route> routes,
+                                 List<int[]> served, List<Node> unserved,
+                                 List<int[]> removals, List<int[]> insertions,
+                                 List<double[]> shareOps, double W) {
+        Solution backup = new Solution(solution);
+        int transferCount = 0;
+        int insertCount = 0;
+
+        // Step 1: Removals (always safe)
+        for (int[] r : removals) {
+            Route route = routes.get(r[0]);
+            int idx = route.findStopIndex(r[1]);
+            if (idx >= 0) { route.removeStop(idx); route.evaluate(); }
         }
-        return bestP;
+
+        // Step 2: Demand sharing (creates transfers)
+        for (double[] op : shareOps) {
+            int si = (int) op[0];
+            int origK = (int) op[1];
+            int otherK = (int) op[2];
+            double qty = op[3];
+            int nid = served.get(si)[2];
+            Node tn = inst.getNodeById(nid);
+
+            Route other = routes.get(otherK);
+            int oi = other.findStopIndex(nid);
+            if (oi >= 0) {
+                RouteStop old = other.getStops().get(oi);
+                double ed = old.isDropoff() ? old.getDropoffQty() : 0;
+                other.getStops().set(oi, old.isServed()
+                        ? RouteStop.serveAndDropoff(tn, ed + qty) : RouteStop.dropoff(tn, ed + qty));
+            } else {
+                int pos = findBestPos(other, tn, inst, true, qty);
+                if (pos < 0) { System.out.printf("[TPO-MIP] SKIP share at node %d (no pos)%n", nid); continue; }
+                other.insertStop(pos, RouteStop.dropoff(tn, qty));
+            }
+            other.evaluate();
+
+            Route orig = routes.get(origK);
+            int oi2 = orig.findStopIndex(nid);
+            if (oi2 >= 0) {
+                RouteStop old = orig.getStops().get(oi2);
+                double ep = old.isPickup() ? old.getPickupQty() : 0;
+                orig.getStops().set(oi2, old.isServed()
+                        ? RouteStop.serveAndPickup(tn, ep + qty) : RouteStop.pickup(tn, ep + qty));
+                orig.evaluate();
+            }
+
+            // Early sync check: dropper(other) arrival - picker(orig) arrival ≤ W
+            // Dropper arrives first → no problem (load waits at node)
+            // Picker arrives first → picker must wait ≤ W for dropper
+            double dropperArr = other.getArrivalTimeAtNode(nid);
+            double pickerArr = orig.getArrivalTimeAtNode(nid);
+            double syncGap = dropperArr - pickerArr;
+            if (syncGap > W + 1e-6) {
+                System.out.printf("[TPO-MIP] SKIP share at node %d: sync gap=%.1f > W=%.1f (dropper=%.1f, picker=%.1f)%n",
+                        nid, syncGap, W, dropperArr, pickerArr);
+                // Revert: would be complex, let final validation handle it
+                // But still register — final validation will rollback if needed
+            }
+
+            solution.addTransfer(new Transfer(nid, other.getVehicleId(), orig.getVehicleId(), qty));
+            transferCount++;
+        }
+
+        // Step 3: Insertions one by one (sorted by profit desc)
+        insertions.sort((a, b) -> Double.compare(
+                unserved.get(b[0]).getProfit(), unserved.get(a[0]).getProfit()));
+
+        for (int[] insOp : insertions) {
+            Node u = unserved.get(insOp[0]);
+            Route route = routes.get(insOp[1]);
+            int pos = findBestPos(route, u, inst, false, 0);
+            if (pos >= 0) {
+                route.insertStop(pos, RouteStop.serve(u));
+                route.evaluate();
+                if (route.isFeasible()) {
+                    insertCount++;
+                    System.out.printf("[TPO-MIP] Inserted node %d (p=%.0f) in v%d%n",
+                            u.getId(), u.getProfit(), insOp[1]);
+                } else {
+                    route.removeStop(route.findStopIndex(u.getId()));
+                    route.evaluate();
+                    System.out.printf("[TPO-MIP] SKIP node %d (time infeasible in v%d)%n", u.getId(), insOp[1]);
+                }
+            } else {
+                System.out.printf("[TPO-MIP] SKIP node %d (no position in v%d)%n", u.getId(), insOp[1]);
+            }
+        }
+
+        // Step 4: Validate
+        for (Route r : routes) r.evaluate();
+        if (!solution.isFeasible() || solution.getTotalProfit() <= backup.getTotalProfit()) {
+            if (!solution.isFeasible()) {
+                Solution.FeasibilityReport fr = solution.checkFeasibility();
+                System.out.println("[TPO-MIP] Post-apply infeasible:");
+                for (String v : fr.getViolations()) System.out.println("  → " + v);
+            }
+            System.out.printf("[TPO-MIP] Rollback (%.0f ≤ %.0f)%n",
+                    solution.getTotalProfit(), backup.getTotalProfit());
+            solution.restoreFrom(backup);
+            for (Route r : solution.getRoutes()) r.evaluate();
+            return 0;
+        }
+
+        System.out.printf("[TPO-MIP] SUCCESS: %.0f → %.0f (+%.0f), %d inserts, %d transfers%n",
+                backup.getTotalProfit(), solution.getTotalProfit(),
+                solution.getTotalProfit() - backup.getTotalProfit(),
+                insertCount, transferCount);
+        return insertCount + transferCount;
     }
 
-    /** Find best position for a pickup stop where arc loads remain valid */
-    private int findBestPickupPos(Route route, Node node, double qty, Instance inst) {
-        route.evaluate();
-        double bestDet = Double.MAX_VALUE;
+    private int findBestPos(Route route, Node node, Instance inst, boolean isDropoff, double qty) {
+        double bestTime = Double.MAX_VALUE;
         int bestP = -1;
         for (int p = 0; p <= route.size(); p++) {
-            route.insertStop(p, RouteStop.pickup(node, qty));
+            RouteStop s = isDropoff ? RouteStop.dropoff(node, qty) : RouteStop.serve(node);
+            route.insertStop(p, s);
             route.evaluate();
-            if (route.isFeasible()) {
-                double det = route.getTotalTime();
-                if (det < bestDet) { bestDet = det; bestP = p; }
+            if (route.isFeasible() && route.getTotalTime() < bestTime) {
+                bestTime = route.getTotalTime();
+                bestP = p;
             }
             route.removeStop(p);
             route.evaluate();
