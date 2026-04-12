@@ -180,6 +180,9 @@ public class ALNSEngine {
                 admissibleSol = candidate;
 
                 if (candProfit > admProfit) {
+                    // Improving move → intensify with LS + PI
+                    // This is critical for performance: polishing every improving
+                    // solution gives ALNS a higher-quality baseline to perturb from.
                     destroyScores[dOp] += sigma2;
                     repairScores[rOp] += sigma2;
 
