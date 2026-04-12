@@ -55,7 +55,7 @@ public class Route {
         for (RouteStop s : other.stops) {
             this.stops.add(new RouteStop(
                     s.getNode(), s.isServed(), s.isPickup(), s.isDropoff(),
-                    s.getPickupQty(), s.getDropoffQty()));
+                    s.getPickupQty(), s.getDropoffQty(), s.getDeliveryQty()));
         }
         this.evaluated = false;
     }

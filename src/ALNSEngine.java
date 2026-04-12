@@ -3,45 +3,39 @@ import java.util.*;
 /**
  * Adaptive Large Neighborhood Search (ALNS) engine for CTOP-T-Sync.
  *
- * Framework adapted from Hammami et al. (2024) HALNS for CTOP:
- *   - Multiple destroy/repair operators with adaptive weight selection
- *   - Simulated Annealing acceptance criterion
- *   - Periodic local search on promising solutions
- *   - Transfer optimization integrated into the improvement loop
+ * Framework adapted from Hammami et al. (2024) HALNS for CTOP,
+ * with transfer mechanism from Aguayo et al. (2025) VRP-T.
  *
  * Algorithm outline:
- *   1. Construct initial solution
- *   2. Repeat for maxIterations:
- *      a. Select destroy and repair operators (roulette wheel on adaptive weights)
- *      b. Destroy: remove β nodes from current solution
- *      c. Repair: reinsert nodes
- *      d. Accept/reject via SA criterion
- *      e. If new best → apply local search + transfer optimization
- *      f. Update operator weights based on performance
- *   3. Return best solution found
+ *   Phase 1: Construct initial solution
+ *   Phase 2: ALNS iterations (destroy/repair with SA acceptance)
+ *     - On new best → TransformOperator (Aguayo-adapted transfers)
+ *     - Periodic transfer attempts on admissible solution
+ *   Phase 3: Final local search polish
+ *   Phase 4: Transfer optimization (TransformOperator on best + admissible)
+ *   Phase 5: Pool comparison → return best of {CTOP, CTOP-T-Sync}
  */
 public class ALNSEngine {
 
     // ── ALNS Parameters ──
     private final int maxIterations;
-    private final int segmentLength;       // iterations per segment (for weight updates)
+    private final int segmentLength;
     private final double initTemperature;
     private final double coolingRate;
     private final double minTemperature;
-    private final int betaMin, betaMax;    // range for number of nodes to remove
+    private final int betaMin, betaMax;
 
     // ── Adaptive weight parameters (Ropke & Pisinger, 2006) ──
-    private final double sigma1 = 33;  // reward: new global best found
-    private final double sigma2 = 9;   // reward: better than current (accepted)
-    private final double sigma3 = 3;   // reward: accepted but not improving
-    private final double reactionFactor; // λ: how fast weights adapt (0.8 recommended)
+    private final double sigma1 = 33;
+    private final double sigma2 = 9;
+    private final double sigma3 = 3;
+    private final double reactionFactor;
 
     // ── Components ──
     private final DestroyOperators destroyOps;
     private final RepairOperators repairOps;
     private final LocalSearch localSearch;
     private final TransformOperator transformOperator;
-    private final TransferMIP transferMIP;
     private final Random rng;
 
     // ── Adaptive weights ──
@@ -63,9 +57,6 @@ public class ALNSEngine {
     // CONSTRUCTORS
     // ══════════════════════════════════════════════════════════
 
-    /**
-     * Full constructor with all parameters.
-     */
     public ALNSEngine(int maxIterations, int segmentLength,
                       double initTemperature, double coolingRate, double minTemperature,
                       int betaMin, int betaMax, double reactionFactor,
@@ -84,28 +75,14 @@ public class ALNSEngine {
         this.repairOps = new RepairOperators(rng);
         this.localSearch = new LocalSearch();
         this.transformOperator = new TransformOperator();
-        this.transferMIP = new TransferMIP();
 
         initWeights();
     }
 
-    /**
-     * Convenience constructor with sensible defaults.
-     * Parameters calibrated based on Hammami (2024) sensitivity analysis.
-     */
     public ALNSEngine(int maxIterations, long seed) {
-        this(maxIterations,
-                100,          // segment length
-                50.0,         // initial temperature
-                0.9997,       // cooling rate (slow cooling per Hammami: c=0.9997-0.9999)
-                0.01,         // min temperature
-                2,            // beta min
-                6,            // beta max (up to 20% of served nodes)
-                0.8,          // reaction factor λ
-                seed);
+        this(maxIterations, 100, 50.0, 0.9997, 0.01, 2, 6, 0.8, seed);
     }
 
-    /** Default: 5000 iterations */
     public ALNSEngine(long seed) {
         this(5000, seed);
     }
@@ -114,9 +91,6 @@ public class ALNSEngine {
     // MAIN SOLVE METHOD
     // ══════════════════════════════════════════════════════════
 
-    /**
-     * Runs the full ALNS procedure on the given instance.
-     */
     public Solution solve(Instance instance) {
         long startTime = System.currentTimeMillis();
 
@@ -130,20 +104,14 @@ public class ALNSEngine {
         Solution admissibleSol = new Solution(currentSol);
         double bestProfit = bestSol.getTotalProfit();
 
-        // ── Separate transfer solution pool ──
-        // Tracks the best feasible solution that contains transfers.
-        // ALNS destroy/repair cycles erase transfers, so without this pool,
-        // good transfer solutions found mid-search are lost forever.
+        // Transfer solution pool
         Solution bestTransferSol = null;
         double bestTransferProfit = 0;
 
         System.out.printf("[ALNS] Initial: profit=%.0f, served=%d/%d%n",
                 bestProfit, bestSol.getNumServed(), bestSol.getNumCustomers());
 
-        // ── Auto-calibrate initial temperature ──
-        // Temperature should accept a ~5% worsening move with ~50% probability
-        // P = exp(-delta/T) = 0.5  →  T = -delta / ln(0.5)
-        // delta = 5% of current profit
+        // Auto-calibrate initial temperature
         double calibDelta = Math.max(bestProfit * 0.05, 1.0);
         double autoTemp = -calibDelta / Math.log(0.5);
         double temperature = Math.max(autoTemp, 1.0);
@@ -154,32 +122,29 @@ public class ALNSEngine {
         // ── Phase 2: ALNS iterations ──
         int iterWithoutImprovement = 0;
         int maxNoImprove = maxIterations / 3;
-        int transferInterval = Math.max(200, maxIterations / 25); // periodic transfer attempts
+        int transferInterval = Math.max(200, maxIterations / 25);
 
         acceptedCount = 0;
         newBestCount = 0;
 
         for (int iter = 0; iter < maxIterations; iter++) {
 
-            // Adaptive β: scale with solution size
             int currentServed = admissibleSol.getNumServed();
             int adjustedBetaMax = Math.max(betaMax, (int)(0.25 * currentServed));
             int beta = betaMin + rng.nextInt(Math.max(1, adjustedBetaMax - betaMin + 1));
 
-            // Select operators (adaptive roulette wheel)
             int dOp = selectOperator(destroyWeights);
             int rOp = selectOperator(repairWeights);
 
-            // Copy current admissible solution
             Solution candidate = new Solution(admissibleSol);
 
             // Destroy
             List<Node> removed = destroyOps.apply(dOp, candidate, beta);
 
             // Repair
-            int inserted = repairOps.apply(rOp, candidate, removed);
+            repairOps.apply(rOp, candidate, removed);
 
-            // Clean up any stale transfers from the destroy/repair cycle
+            // Clean up stale transfers
             candidate.cleanupStaleTransfers();
 
             // Evaluate
@@ -196,7 +161,7 @@ public class ALNSEngine {
             double candProfit = candidate.getTotalProfit();
             double admProfit = admissibleSol.getTotalProfit();
 
-            // ── SA Acceptance Criterion ──
+            // SA Acceptance
             double delta = candProfit - admProfit;
             boolean accepted = false;
 
@@ -207,7 +172,6 @@ public class ALNSEngine {
                 accepted = rng.nextDouble() < probability;
             }
 
-            // ── Update scores and solution ──
             destroyUsageCounts[dOp]++;
             repairUsageCounts[rOp]++;
 
@@ -216,7 +180,6 @@ public class ALNSEngine {
                 admissibleSol = candidate;
 
                 if (candProfit > admProfit) {
-                    // Better than admissible → apply local search
                     destroyScores[dOp] += sigma2;
                     repairScores[rOp] += sigma2;
 
@@ -230,14 +193,11 @@ public class ALNSEngine {
 
                 // Check if new global best
                 if (candProfit > bestProfit) {
-                    // Apply transfer optimization on new best
+                    // Apply TransformOperator on new best
                     Solution preTransfer = new Solution(admissibleSol);
                     transformOperator.optimize(admissibleSol);
                     localSearch.postInsert(admissibleSol);
-                    localSearch.improve(admissibleSol);
-                    localSearch.postInsert(admissibleSol);
 
-                    // Verify feasibility — rollback transfers if broken
                     if (!admissibleSol.isFeasible()) {
                         admissibleSol = preTransfer;
                     }
@@ -277,7 +237,6 @@ public class ALNSEngine {
 
             // ── Periodic transfer attempt on admissible solution ──
             if (iter > 0 && iter % transferInterval == 0) {
-                // Try heuristic Transform first (fast)
                 Solution transferTest = new Solution(admissibleSol);
                 int tCount = transformOperator.optimize(transferTest);
                 if (tCount > 0 && transferTest.isFeasible()) {
@@ -286,13 +245,15 @@ public class ALNSEngine {
                     localSearch.postInsert(transferTest);
                     if (transferTest.isFeasible()) {
                         double tProfit = transferTest.getTotalProfit();
+
                         if (!transferTest.getTransfers().isEmpty()
                                 && tProfit > bestTransferProfit) {
                             bestTransferSol = new Solution(transferTest);
                             bestTransferProfit = tProfit;
-                            System.out.printf("[ALNS] iter %5d | TRANSFER POOL updated: profit=%.0f transfers=%d (heuristic)%n",
+                            System.out.printf("[ALNS] iter %5d | TRANSFER POOL updated: profit=%.0f transfers=%d (periodic)%n",
                                     iter, bestTransferProfit, bestTransferSol.getTransfers().size());
                         }
+
                         if (tProfit > admissibleSol.getTotalProfit()) {
                             admissibleSol = transferTest;
                             if (tProfit > bestProfit) {
@@ -300,39 +261,10 @@ public class ALNSEngine {
                                 bestProfit = tProfit;
                                 newBestCount++;
                                 iterWithoutImprovement = 0;
+                                System.out.printf("[ALNS] iter %5d | NEW BEST profit=%.0f served=%d (periodic transform)%n",
+                                        iter, bestProfit, bestSol.getNumServed());
                             }
                         }
-                    }
-                }
-
-                // Try MIP on elite solutions (every 2nd periodic interval)
-                if (iter % (transferInterval * 2) == 0) {
-                    Solution mipTest = new Solution(admissibleSol);
-                    try {
-                        int mipCount = transferMIP.optimize(mipTest);
-                        if (mipCount > 0 && mipTest.isFeasible()) {
-                            localSearch.postInsert(mipTest);
-                            double mProfit = mipTest.getTotalProfit();
-                            if (!mipTest.getTransfers().isEmpty() && mProfit > bestTransferProfit) {
-                                bestTransferSol = new Solution(mipTest);
-                                bestTransferProfit = mProfit;
-                                System.out.printf("[ALNS] iter %5d | TRANSFER POOL updated: profit=%.0f transfers=%d (MIP)%n",
-                                        iter, bestTransferProfit, bestTransferSol.getTransfers().size());
-                            }
-                            if (mProfit > admissibleSol.getTotalProfit()) {
-                                admissibleSol = mipTest;
-                                if (mProfit > bestProfit) {
-                                    bestSol = new Solution(mipTest);
-                                    bestProfit = mProfit;
-                                    newBestCount++;
-                                    iterWithoutImprovement = 0;
-                                    System.out.printf("[ALNS] iter %5d | NEW BEST profit=%.0f (periodic MIP)%n",
-                                            iter, bestProfit);
-                                }
-                            }
-                        }
-                    } catch (Exception e) {
-                        // MIP failure is non-fatal
                     }
                 }
             }
@@ -343,10 +275,10 @@ public class ALNSEngine {
             // ── Weight update at segment boundaries ──
             updateWeightsIfSegmentEnd(iter);
 
-            // ── Restart mechanism (if stuck) ──
+            // ── Restart mechanism ──
             if (iterWithoutImprovement >= maxNoImprove) {
                 admissibleSol = new Solution(bestSol);
-                temperature = startTemp * 0.5; // reheat to half
+                temperature = startTemp * 0.5;
                 iterWithoutImprovement = 0;
             }
         }
@@ -355,53 +287,44 @@ public class ALNSEngine {
         localSearch.improve(bestSol);
         localSearch.postInsert(bestSol);
 
-        // ── Phase 4: Transfer Optimization (Transform + MIP) ──
-        System.out.println("\n[ALNS] Phase 4: Transfer Optimization");
+        // ── Phase 4: Transfer Optimization (Aguayo Transform) ──
+        System.out.println("\n[ALNS] Phase 4: Transfer Optimization (Aguayo Transform)");
 
-        // 4a: Heuristic Transform
-        Solution transformSol = new Solution(bestSol);
-        transformOperator.optimize(transformSol);
-        if (transformSol.isFeasible() && transformSol.getTotalProfit() > bestTransferProfit
-                && !transformSol.getTransfers().isEmpty()) {
-            bestTransferSol = new Solution(transformSol);
-            bestTransferProfit = transformSol.getTotalProfit();
-        }
-
-        // 4b: MIP on best solution
-        System.out.println("[ALNS] Phase 4b: Transfer MIP on best solution");
-        Solution mipSol = new Solution(bestSol);
-        try {
-            int mipCount = transferMIP.optimize(mipSol);
-            if (mipSol.isFeasible() && mipSol.getTotalProfit() > bestTransferProfit) {
-                bestTransferSol = new Solution(mipSol);
-                bestTransferProfit = mipSol.getTotalProfit();
-                System.out.printf("[ALNS] MIP improved: profit=%.0f transfers=%d%n",
+        // 4a: Transform on best solution
+        Solution transformBest = new Solution(bestSol);
+        int tCount = transformOperator.optimize(transformBest);
+        if (tCount > 0 && transformBest.isFeasible()) {
+            localSearch.postInsert(transformBest);
+            if (transformBest.isFeasible() && !transformBest.getTransfers().isEmpty()
+                    && transformBest.getTotalProfit() > bestTransferProfit) {
+                bestTransferSol = new Solution(transformBest);
+                bestTransferProfit = transformBest.getTotalProfit();
+                System.out.printf("[ALNS] Transform on best: profit=%.0f transfers=%d%n",
                         bestTransferProfit, bestTransferSol.getTransfers().size());
             }
-        } catch (Exception e) {
-            System.out.println("[ALNS] MIP failed: " + e.getMessage());
         }
 
-        // 4c: MIP on admissible solution (may differ from best)
+        // 4b: Transform on admissible solution (if different from best)
         if (admissibleSol.getTotalProfit() != bestSol.getTotalProfit()) {
-            System.out.println("[ALNS] Phase 4c: Transfer MIP on admissible solution");
-            Solution mipAdm = new Solution(admissibleSol);
-            try {
-                transferMIP.optimize(mipAdm);
-                if (mipAdm.isFeasible() && mipAdm.getTotalProfit() > bestTransferProfit) {
-                    bestTransferSol = new Solution(mipAdm);
-                    bestTransferProfit = mipAdm.getTotalProfit();
-                    System.out.printf("[ALNS] MIP (admissible) improved: profit=%.0f transfers=%d%n",
+            Solution transformAdm = new Solution(admissibleSol);
+            tCount = transformOperator.optimize(transformAdm);
+            if (tCount > 0 && transformAdm.isFeasible()) {
+                localSearch.postInsert(transformAdm);
+                if (transformAdm.isFeasible() && !transformAdm.getTransfers().isEmpty()
+                        && transformAdm.getTotalProfit() > bestTransferProfit) {
+                    bestTransferSol = new Solution(transformAdm);
+                    bestTransferProfit = transformAdm.getTotalProfit();
+                    System.out.printf("[ALNS] Transform on admissible: profit=%.0f transfers=%d%n",
                             bestTransferProfit, bestTransferSol.getTransfers().size());
                 }
-            } catch (Exception e) { /* non-fatal */ }
+            }
         }
 
         if (bestTransferSol == null || bestTransferProfit <= bestSol.getTotalProfit()) {
             System.out.println("[ALNS] No profitable transfer solution found");
         }
 
-        // ── Phase 5: Pool comparison — return the best overall ──
+        // ── Phase 5: Pool comparison ──
         if (!bestSol.isFeasible()) {
             bestSol.getTransfers().clear();
             bestSol.cleanupStaleTransfers();
@@ -424,7 +347,7 @@ public class ALNSEngine {
             } else {
                 System.out.printf("[ALNS] No-transfer solution wins: profit=%.0f ≥ transfer=%.0f%n",
                         winner.getTotalProfit(),
-                        bestTransferSol != null ? bestTransferSol.getTotalProfit() : 0);
+                        bestTransferSol.getTotalProfit());
             }
         } else {
             System.out.println("[ALNS] No feasible transfer solution found");
@@ -452,14 +375,10 @@ public class ALNSEngine {
         repairScores = new double[nRepair];
         repairUsageCounts = new int[nRepair];
 
-        // Initialize all weights equally
         Arrays.fill(destroyWeights, 1.0);
         Arrays.fill(repairWeights, 1.0);
     }
 
-    /**
-     * Roulette wheel selection based on operator weights.
-     */
     private int selectOperator(double[] weights) {
         double total = 0;
         for (double w : weights) total += w;
@@ -474,31 +393,20 @@ public class ALNSEngine {
         return weights.length - 1;
     }
 
-    /**
-     * Updates operator weights at segment boundaries.
-     *
-     * New weight = λ × old_weight + (1-λ) × (score / usage_count)
-     *
-     * Following Ropke & Pisinger (2006) adaptive mechanism.
-     */
     private void updateWeightsIfSegmentEnd(int iter) {
         if ((iter + 1) % segmentLength != 0) return;
 
-        // Update destroy weights
         for (int i = 0; i < destroyWeights.length; i++) {
             if (destroyUsageCounts[i] > 0) {
                 double avgScore = destroyScores[i] / destroyUsageCounts[i];
                 destroyWeights[i] = reactionFactor * destroyWeights[i]
                         + (1 - reactionFactor) * avgScore;
             }
-            // Ensure minimum weight to avoid starvation
             destroyWeights[i] = Math.max(destroyWeights[i], 0.1);
-            // Reset scores and counts for next segment
             destroyScores[i] = 0;
             destroyUsageCounts[i] = 0;
         }
 
-        // Update repair weights
         for (int i = 0; i < repairWeights.length; i++) {
             if (repairUsageCounts[i] > 0) {
                 double avgScore = repairScores[i] / repairUsageCounts[i];
@@ -515,9 +423,6 @@ public class ALNSEngine {
     // REPORTING
     // ══════════════════════════════════════════════════════════
 
-    /**
-     * Prints a summary report of the ALNS run.
-     */
     public void printReport(Solution bestSol) {
         System.out.println("\n┌──────────────────────────────────────────────┐");
         System.out.println("│             ALNS Run Report                  │");
@@ -537,13 +442,17 @@ public class ALNSEngine {
 
         System.out.print("│    Destroy: ");
         for (int i = 0; i < destroyWeights.length; i++) {
-            System.out.printf("%s=%.1f ", destroyOps.getOperatorName(i).substring(0, Math.min(4, destroyOps.getOperatorName(i).length())), destroyWeights[i]);
+            System.out.printf("%s=%.1f ",
+                    destroyOps.getOperatorName(i).substring(0, Math.min(4, destroyOps.getOperatorName(i).length())),
+                    destroyWeights[i]);
         }
         System.out.println("│");
 
         System.out.print("│    Repair:  ");
         for (int i = 0; i < repairWeights.length; i++) {
-            System.out.printf("%s=%.1f ", repairOps.getOperatorName(i).substring(0, Math.min(4, repairOps.getOperatorName(i).length())), repairWeights[i]);
+            System.out.printf("%s=%.1f ",
+                    repairOps.getOperatorName(i).substring(0, Math.min(4, repairOps.getOperatorName(i).length())),
+                    repairWeights[i]);
         }
         System.out.println("│");
 

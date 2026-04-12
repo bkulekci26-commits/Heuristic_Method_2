@@ -165,9 +165,13 @@ public class ExperimentRunner {
 
                 // Console summary
                 System.out.printf("  Result: profit=%.0f (baseline=%.0f, Δ%+.0f, %+.1f%%) | " +
-                                "served=%d/%d | transfers=%d | time=%dms | feasible=%s%n%n",
+                                "served=%d/%d | transfers=%d | time=%dms | feasible=%s%n",
                         alnsProfit, baselineProfit, improvement, improvementPct,
                         alnsServed, inst.getNumCustomers(), alnsTransfers, elapsed, feasible);
+
+                // ── Detailed route printout (always print for verification) ──
+                printDetailedRoutes(best, inst);
+                System.out.println();
 
             } catch (Exception e) {
                 System.err.printf("  ERROR on %s: %s%n%n", fileName, e.getMessage());
@@ -188,6 +192,133 @@ public class ExperimentRunner {
         System.out.printf("  EXPERIMENT COMPLETE: %d instances processed%n", totalInstances);
         System.out.printf("  Results written to: %s%n", outputCsvPath);
         System.out.println("═".repeat(60));
+    }
+
+    // ── Detailed Route Printing ──
+
+    /**
+     * Prints a node-by-node breakdown of each route for visual feasibility verification.
+     *
+     * Format per route:
+     *   depot(0) →[load/Q, t=0.0] node_id[action] →[load/Q, t=arr] ... → depot(0) [t=total]
+     *
+     * Actions: [S] = serve, [S:partial/full] = split serve, [P:qty] = pickup, [D:qty] = dropoff
+     * Load shown on each arc (between nodes). Capacity Q and time Tmax shown for comparison.
+     */
+    private static void printDetailedRoutes(Solution sol, Instance inst) {
+        double Q = inst.getMaxCapacity();
+        double Tmax = inst.getMaxRouteDuration();
+        double W = inst.getSyncWindow();
+
+        System.out.println("  ┌─────────────────────────────────────────────────────────────┐");
+        System.out.printf( "  │  DETAILED ROUTES  (Q=%.0f, Tmax=%.0f, W=%.0f)%n", Q, Tmax, W);
+        System.out.println("  ├─────────────────────────────────────────────────────────────┤");
+
+        for (Route r : sol.getRoutes()) {
+            r.evaluate();
+            System.out.printf("  │  Vehicle %d:  profit=%.0f  time=%.1f/%.0f  load=%.0f/%.0f  stops=%d%n",
+                    r.getVehicleId(), r.getTotalProfit(), r.getTotalTime(), Tmax,
+                    r.getInitialLoad(), Q, r.size());
+
+            // Print node-by-node sequence
+            StringBuilder seq = new StringBuilder();
+            StringBuilder details = new StringBuilder();
+            Node depot = inst.getDepot();
+
+            seq.append(String.format("  │    0(depot)"));
+            details.append(String.format("  │    t=%-6.1f load=%-5.0f ", 0.0, r.getArcLoad(0)));
+
+            for (int i = 0; i < r.size(); i++) {
+                RouteStop s = r.getStops().get(i);
+                Node n = s.getNode();
+                double arrTime = r.getArrivalTime(i + 1); // +1 because index 0 is depot
+                double arcLoadAfter = (i + 1 < r.size() + 1) ? r.getArcLoad(i + 1) : 0;
+
+                // Build action string
+                StringBuilder action = new StringBuilder();
+                if (s.isServed()) {
+                    if (s.isSplitDelivery()) {
+                        action.append(String.format("S:%.0f/%.0f", s.getDeliveryQty(), n.getDemand()));
+                    } else {
+                        action.append("S");
+                    }
+                }
+                if (s.isPickup()) {
+                    if (action.length() > 0) action.append("+");
+                    action.append(String.format("P:%.0f", s.getPickupQty()));
+                }
+                if (s.isDropoff()) {
+                    if (action.length() > 0) action.append("+");
+                    action.append(String.format("D:%.0f", s.getDropoffQty()));
+                }
+
+                seq.append(String.format(" → %d[%s]", n.getId(), action));
+                details.append(String.format("→ t=%-6.1f load=%-5.0f ", arrTime, arcLoadAfter));
+            }
+
+            // Return to depot
+            double returnTime = r.getArrivalTime(r.size() + 1);
+            seq.append(String.format(" → 0(depot)"));
+            details.append(String.format("→ t=%-6.1f", returnTime));
+
+            System.out.println(seq);
+            System.out.println(details);
+
+            // Feasibility check per route
+            boolean timeFeasible = r.getTotalTime() <= Tmax + 1e-6;
+            boolean capFeasible = true;
+            for (int i = 0; i <= r.size(); i++) {
+                if (r.getArcLoad(i) > Q + 1e-6 || r.getArcLoad(i) < -1e-6) {
+                    capFeasible = false;
+                    break;
+                }
+            }
+            String status = (timeFeasible && capFeasible) ? "✓ FEASIBLE" :
+                    (!timeFeasible && !capFeasible) ? "✗ TIME+CAP VIOLATED" :
+                            (!timeFeasible) ? "✗ TIME VIOLATED" : "✗ CAPACITY VIOLATED";
+            System.out.printf("  │    Status: %s%n", status);
+            System.out.println("  │");
+        }
+
+        // Print transfer details
+        if (!sol.getTransfers().isEmpty()) {
+            System.out.println("  ├─────────────────────────────────────────────────────────────┤");
+            System.out.println("  │  TRANSFERS:");
+            for (Transfer t : sol.getTransfers()) {
+                try {
+                    Route giverRoute = sol.getRouteByVehicleId(t.getGivingVehicleId());
+                    Route receiverRoute = sol.getRouteByVehicleId(t.getReceivingVehicleId());
+                    double giverArr = giverRoute.getArrivalTimeAtNode(t.getTransferNodeId());
+                    double receiverArr = receiverRoute.getArrivalTimeAtNode(t.getTransferNodeId());
+                    double syncGap = giverArr - receiverArr;
+                    String syncStatus = (syncGap <= W + 1e-6) ? "✓" : "✗ SYNC VIOLATED";
+
+                    System.out.printf("  │    Node %d: v%d(dropper, t=%.1f) → v%d(picker, t=%.1f) " +
+                                    "qty=%.0f  gap=%.1f  %s%n",
+                            t.getTransferNodeId(),
+                            t.getGivingVehicleId(), giverArr,
+                            t.getReceivingVehicleId(), receiverArr,
+                            t.getQuantity(), syncGap, syncStatus);
+                } catch (Exception e) {
+                    System.out.printf("  │    Transfer at node %d: ERROR - %s%n",
+                            t.getTransferNodeId(), e.getMessage());
+                }
+            }
+        }
+
+        // Overall feasibility
+        Solution.FeasibilityReport report = sol.checkFeasibility();
+        System.out.println("  ├─────────────────────────────────────────────────────────────┤");
+        if (report.isFeasible()) {
+            System.out.printf("  │  OVERALL: ✓ FEASIBLE  profit=%.0f  served=%d  transfers=%d%n",
+                    sol.getTotalProfit(), sol.getNumServed(), sol.getTransfers().size());
+        } else {
+            System.out.printf("  │  OVERALL: ✗ INFEASIBLE  (%d violations)%n", report.getViolations().size());
+            for (String v : report.getViolations()) {
+                System.out.printf("  │    ✗ %s%n", v);
+            }
+        }
+        System.out.println("  └─────────────────────────────────────────────────────────────┘");
     }
 
     // ── Utility ──
