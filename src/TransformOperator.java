@@ -65,6 +65,9 @@ public class TransformOperator {
     //  MAIN ENTRY POINT
     // ══════════════════════════════════════════════════════════════════════════
 
+    /** Maximum time (ms) allowed for the entire optimize() call */
+    private static final long TIME_BUDGET_MS = 5000; // 5 seconds max
+
     /**
      * Optimize the solution by finding profitable transfer opportunities.
      * Returns the number of improving moves applied.
@@ -74,15 +77,22 @@ public class TransformOperator {
         int totalMoves = 0;
         int directInserts = 0, swaps = 0, transfersA = 0, transfersB = 0;
         boolean improved = true;
+        long startTime = System.currentTimeMillis();
 
         while (improved) {
             improved = false;
+            long elapsed = System.currentTimeMillis() - startTime;
+            if (elapsed > TIME_BUDGET_MS) {
+                System.out.printf("[Transform] Time budget exceeded (%.1fs), stopping%n",
+                        elapsed / 1000.0);
+                break;
+            }
 
             // Find the best move across all strategies
             Move bestDirect = findBestDirectInsert(solution);
             Move bestSwap = findBestSingleSwap(solution);
-            Move bestTransferA = findBestCrossTransfer(solution);
-            Move bestTransferB = findBestReverseTransfer(solution);
+            Move bestTransferA = findBestCrossTransfer(solution, startTime);
+            Move bestTransferB = findBestReverseTransfer(solution, startTime);
 
             // Pick the best overall
             Move best = null;
@@ -228,7 +238,7 @@ public class TransformOperator {
      *   Node u can be inserted at ANY position (not just before j) — the route
      *   copy feasibility check handles all arc load constraints correctly.
      */
-    private Move findBestCrossTransfer(Solution sol) {
+    private Move findBestCrossTransfer(Solution sol, long startTime) {
         Instance inst = sol.getInstance();
         List<Route> routes = sol.getRoutes();
         List<Node> unserved = sol.getUnservedNodes();
@@ -243,6 +253,7 @@ public class TransformOperator {
         unserved.sort((a, b) -> Double.compare(b.getProfit(), a.getProfit()));
 
         for (int i1 = 0; i1 < K; i1++) {
+            if (System.currentTimeMillis() - startTime > TIME_BUDGET_MS) break;
             Route k1 = routes.get(i1);
             k1.evaluate();
 
@@ -372,7 +383,7 @@ public class TransformOperator {
      *   k1: depot → ... → u[S] → ... → j[P:tq] → ... → depot
      *   k2: depot → ... → j[S+D:tq] → ... → depot
      */
-    private Move findBestReverseTransfer(Solution sol) {
+    private Move findBestReverseTransfer(Solution sol, long startTime) {
         Instance inst = sol.getInstance();
         List<Route> routes = sol.getRoutes();
         List<Node> unserved = sol.getUnservedNodes();
@@ -385,6 +396,7 @@ public class TransformOperator {
         unserved.sort((a, b) -> Double.compare(b.getProfit(), a.getProfit()));
 
         for (int i2 = 0; i2 < K; i2++) {
+            if (System.currentTimeMillis() - startTime > TIME_BUDGET_MS) break;
             Route k2 = routes.get(i2);   // server+dropper: has j, will add dropoff
             k2.evaluate();
             double k2SpareCap = k2.getRemainingCapacity();
@@ -406,6 +418,7 @@ public class TransformOperator {
 
                 for (int i1 = 0; i1 < K; i1++) {
                     if (i1 == i2) continue;
+                    if (System.currentTimeMillis() - startTime > TIME_BUDGET_MS) break;
                     Route k1 = routes.get(i1);   // picker: detours to j
                     k1.evaluate();
 

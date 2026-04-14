@@ -271,7 +271,7 @@ public class ParameterTuningRunner {
                             config.maxIterations, config.segmentLength, config.coolingRate,
                             config.betaMin, config.betaMax, config.reactionFactor,
                             fileName,
-                            inst.getNumCustomers(), inst.getNumVehicles(),
+                            inst.getNumCustomers(), inst.getMaxVehicles(),
                             inst.getMaxCapacity(), inst.getMaxRouteDuration(), syncWindow,
                             best.getTotalProfit(), best.getNumServed(), best.getTransfers().size(),
                             transferA, transferB,

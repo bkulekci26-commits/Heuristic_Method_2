@@ -14,7 +14,7 @@ public class MainTuning {
 
     public static void main(String[] args) throws Exception {
 
-        String instanceFolder = "C:/Users/beste/Desktop/THESIS/VRP-T/Gurobi/Datasets/archetti_original_2/all";
+        String instanceFolder = "C:/Users/beste/Desktop/THESIS/VRP-T/Gurobi/Datasets/all";
         String outputCsv      = "tuning_results.csv";
         double syncWindow      = 15.0;
         long   seed            = 42L;
