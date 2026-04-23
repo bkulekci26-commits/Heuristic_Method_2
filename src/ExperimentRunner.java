@@ -16,15 +16,19 @@ public class ExperimentRunner {
 
     /**
      * Run experiments on all .txt instance files in the given folder.
+     * Uses multi-start: runs ALNS with each seed, keeps the best solution.
+     *
+     * Tuned parameters (from Stage 1 + Stage 2 experiments):
+     *   I=10000, c=0.9995, betaMax=6, seg=100, lambda=0.8
      *
      * @param instanceFolder  path to the directory containing instance .txt files
      * @param outputCsvPath   path for the output CSV report
-     * @param alnsIterations  number of ALNS iterations per instance
+     * @param alnsIterations  number of ALNS iterations per run
      * @param syncWindow      W parameter for synchronization
-     * @param seed            random seed for reproducibility
+     * @param seeds           array of random seeds (multi-start: best-of-k)
      */
     public static void run(String instanceFolder, String outputCsvPath,
-                           int alnsIterations, double syncWindow, long seed) throws IOException {
+                           int alnsIterations, double syncWindow, long[] seeds) throws IOException {
 
         // ── Discover instance files ──
         List<File> instanceFiles = Files.list(Paths.get(instanceFolder))
@@ -33,7 +37,9 @@ public class ExperimentRunner {
                 .sorted(Comparator.comparing(File::getName))
                 .collect(Collectors.toList());
 
-        System.out.printf("Found %d instance files in %s%n%n", instanceFiles.size(), instanceFolder);
+        System.out.printf("Found %d instance files in %s%n", instanceFiles.size(), instanceFolder);
+        System.out.printf("Multi-start: best-of-%d seeds %s%n%n",
+                seeds.length, java.util.Arrays.toString(seeds));
 
         if (instanceFiles.isEmpty()) {
             System.out.println("No .txt files found. Exiting.");
@@ -50,8 +56,11 @@ public class ExperimentRunner {
                 "ALNS_Profit", "ALNS_Served", "ALNS_Distance", "ALNS_Transfers",
                 "Improvement_Profit", "Improvement_Pct",
                 "Gap_To_Baseline_Pct",
+                "Best_Seed", "Num_Seeds",
+                "Seed_Profits",
                 "Num_New_Bests", "Acceptance_Rate_Pct",
                 "Construction_Profit",
+                "Sync_Gaps",
                 "Route0_Profit", "Route0_Dist", "Route0_Time", "Route0_Load", "Route0_Stops",
                 "Route1_Profit", "Route1_Dist", "Route1_Time", "Route1_Load", "Route1_Stops",
                 "Route2_Profit", "Route2_Dist", "Route2_Time", "Route2_Load", "Route2_Stops",
@@ -89,10 +98,51 @@ public class ExperimentRunner {
                 double baselineDist = baseline.getTotalDistance();
                 double constructProfit = baselineProfit; // before LS for reference
 
-                // ── ALNS ──
+                // ── Multi-start ALNS (best-of-k seeds) ──
+                // Tuned parameters from Stage 1 + Stage 2 experiments:
+                //   I=10000, c=0.9995, betaMax=6, seg=100, lambda=0.8
                 long t0 = System.currentTimeMillis();
-                ALNSEngine alns = new ALNSEngine(alnsIterations, seed);
-                Solution best = alns.solve(inst);
+                Solution best = null;
+                double bestProfit = Double.NEGATIVE_INFINITY;
+                long bestSeed = seeds[0];
+                int bestNewBests = 0;
+                double bestAcceptRate = 0;
+                StringBuilder seedProfits = new StringBuilder();
+
+                for (long s : seeds) {
+                    ALNSEngine alns = new ALNSEngine(
+                            alnsIterations,
+                            100,        // segmentLength (not significant)
+                            50.0,       // initTemperature (auto-calibrated)
+                            0.9995,     // coolingRate (tuned)
+                            0.01,       // minTemperature
+                            2,          // betaMin
+                            6,          // betaMax (not significant, default)
+                            0.8,        // reactionFactor (not significant)
+                            s);
+                    Solution candidate = alns.solve(inst);
+
+                    double candProfit = candidate.getTotalProfit();
+                    if (seedProfits.length() > 0) seedProfits.append(";");
+                    seedProfits.append(String.format("%.0f", candProfit));
+
+                    if (candidate.isFeasible() && candProfit > bestProfit) {
+                        best = candidate;
+                        bestProfit = candProfit;
+                        bestSeed = s;
+                        bestNewBests = alns.getNewBestCount();
+                        bestAcceptRate = alns.getAcceptanceRate();
+                    }
+                }
+
+                // Fallback: if no feasible solution, take last
+                if (best == null) {
+                    ALNSEngine fallback = new ALNSEngine(alnsIterations, seeds[0]);
+                    best = fallback.solve(inst);
+                    bestProfit = best.getTotalProfit();
+                    bestSeed = seeds[0];
+                }
+
                 long elapsed = System.currentTimeMillis() - t0;
 
                 // ── Collect metrics ──
@@ -106,9 +156,28 @@ public class ExperimentRunner {
 
                 boolean feasible = best.isFeasible();
 
-                // ALNS statistics
-                int numNewBests = alns.getNewBestCount();
-                double acceptanceRate = alns.getAcceptanceRate();
+                // ALNS statistics (from best seed's run)
+                int numNewBests = bestNewBests;
+                double acceptanceRate = bestAcceptRate;
+
+                // Sync gaps
+                StringBuilder syncGaps = new StringBuilder();
+                for (Transfer t : best.getTransfers()) {
+                    try {
+                        Route giverRoute = best.getRouteByVehicleId(t.getGivingVehicleId());
+                        Route receiverRoute = best.getRouteByVehicleId(t.getReceivingVehicleId());
+                        giverRoute.evaluate();
+                        receiverRoute.evaluate();
+                        double giverArr = giverRoute.getArrivalTimeAtNode(t.getTransferNodeId());
+                        double receiverArr = receiverRoute.getArrivalTimeAtNode(t.getTransferNodeId());
+                        double gap = giverArr - receiverArr;
+                        if (syncGaps.length() > 0) syncGaps.append(";");
+                        syncGaps.append(String.format("%.1f", gap));
+                    } catch (Exception e2) {
+                        if (syncGaps.length() > 0) syncGaps.append(";");
+                        syncGaps.append("ERR");
+                    }
+                }
 
                 // Per-route details (pad to 4 routes)
                 double[][] routeData = new double[4][5]; // [profit, dist, time, load, stops]
@@ -149,9 +218,13 @@ public class ExperimentRunner {
                         fmt(improvement),
                         fmt(improvementPct),
                         fmt(improvementPct), // gap is same as improvement over baseline
+                        String.valueOf(bestSeed),
+                        String.valueOf(seeds.length),
+                        seedProfits.toString(),
                         String.valueOf(numNewBests),
                         fmt(acceptanceRate),
                         fmt(constructProfit),
+                        syncGaps.toString(),
                         // Route 0-3
                         fmt(routeData[0][0]), fmt(routeData[0][1]), fmt(routeData[0][2]), fmt(routeData[0][3]), fmt(routeData[0][4]),
                         fmt(routeData[1][0]), fmt(routeData[1][1]), fmt(routeData[1][2]), fmt(routeData[1][3]), fmt(routeData[1][4]),
@@ -168,6 +241,8 @@ public class ExperimentRunner {
                                 "served=%d/%d | transfers=%d | time=%dms | feasible=%s%n",
                         alnsProfit, baselineProfit, improvement, improvementPct,
                         alnsServed, inst.getNumCustomers(), alnsTransfers, elapsed, feasible);
+                System.out.printf("  Multi-start: best-of-%d seeds, winner=seed %d, profits=[%s]%n",
+                        seeds.length, bestSeed, seedProfits);
 
                 // ── Detailed route printout (always print for verification) ──
                 printDetailedRoutes(best, inst);
