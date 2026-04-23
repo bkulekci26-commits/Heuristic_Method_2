@@ -21,7 +21,7 @@ import java.util.*;
  *      THIS TYPE IS UNIQUE TO CTOP-T — impossible in SD-CTOP.
  *
  * Key difference from VRP-T: In orienteering, transfers are valuable only if they
- * enable serving ADDITIONAL customers (profit gain), not for distance savings.
+ * enable serving ADDITIONAL customers, not for distance savings.
  */
 public class TransformOperator {
 

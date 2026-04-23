@@ -15,7 +15,7 @@ public class Main {
     public static void main(String[] args) throws Exception {
 
         String instanceFolder = "C:/Users/beste/Desktop/THESIS/VRP-T/Gurobi/Datasets/all";
-        String outputCsv      = "experiment_results_restart3.csv";
+        String outputCsv      = "experiment_results_restart.csv";
         int    alnsIterations  = 10000;
         double syncWindow      = 15.0;
         long[] seeds           = {16, 42L, 123L, 7L, 15};

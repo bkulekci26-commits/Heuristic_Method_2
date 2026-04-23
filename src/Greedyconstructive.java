@@ -54,7 +54,7 @@ public class GreedyConstructive {
         this(1.0, 1.0, 0.5);
     }
 
-    // ──────────────────────────── Main Algorithm ─────────────────────────────
+    // ────────────────────────── Main Algorithm ───────────────────────────
 
     /**
      * Constructs an initial feasible solution (no transfers).

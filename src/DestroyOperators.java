@@ -10,7 +10,7 @@ import java.util.*;
  *   4. Sequence removal (consecutive nodes in a route)
  *   5. Route removal (clear an entire route for restructuring)
  *
- * Each operator removes nodes from the solution and returns them as a list.
+ * Each operator removes nodes from  solution and returns them as a list.
  * The removed nodes become candidates for re-insertion by repair operators.
  * Transfer-related stops (pickup/dropoff-only) are also cleaned up during removal.
  */

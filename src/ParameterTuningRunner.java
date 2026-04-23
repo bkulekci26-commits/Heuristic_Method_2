@@ -24,7 +24,7 @@ import java.util.stream.*;
  *   - AxB interaction (e.g., does high destruction need slower cooling?)
  *   - Variance estimation via 3 replications -> F-tests, confidence intervals
  *
- * Total: 9 configs x 3 seeds x 20 instances = 540 runs (~90 min)
+ * Total: 9 configs x 3 seeds x 20 instances = 540 runs
  */
 public class ParameterTuningRunner {
 

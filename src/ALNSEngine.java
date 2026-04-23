@@ -111,7 +111,7 @@ public class ALNSEngine {
         System.out.printf("[ALNS] Initial: profit=%.0f, served=%d/%d%n",
                 bestProfit, bestSol.getNumServed(), bestSol.getNumCustomers());
 
-        // Auto-calibrate initial temperature
+        // Auto-calibrate temperature
         double calibDelta = Math.max(bestProfit * 0.05, 1.0);
         double autoTemp = -calibDelta / Math.log(0.5);
         double temperature = Math.max(autoTemp, 1.0);

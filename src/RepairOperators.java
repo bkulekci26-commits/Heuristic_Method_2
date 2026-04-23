@@ -213,9 +213,9 @@ public class RepairOperators {
         return inserted;
     }
 
-    // ══════════════════════════════════════════════════════════
+    // ═════════════════════════════════════════════════════════
     // OPERATOR 2: RANDOM INSERTION
-    // ══════════════════════════════════════════════════════════
+    // ═════════════════════════════════════════════════════════
 
     /**
      * Inserts candidates in random order at the first feasible position found.

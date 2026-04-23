@@ -357,7 +357,7 @@ public class ExperimentRunner {
 
         // Print transfer details
         if (!sol.getTransfers().isEmpty()) {
-            System.out.println("  ├─────────────────────────────────────────────────────────────┤");
+            System.out.println("  ├────────────────────────────────────────────────────────────┤");
             System.out.println("  │  TRANSFERS:");
             for (Transfer t : sol.getTransfers()) {
                 try {

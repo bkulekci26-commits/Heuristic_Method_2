@@ -40,7 +40,7 @@
  *   Seeds:    {42, 123, 7}
  *
  * Usage:
- *   java MainTuning [instanceFolder] [outputCsv] [syncWindow]
+ *   java MainTuning [instanceFolder] [outputCsv]
  */
 public class MainTuning {
 

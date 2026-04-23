@@ -494,7 +494,7 @@ public class LocalSearch {
         return profit;
     }
 
-    /** Compute the extra distance from inserting a node at a given position */
+    /** Compute the extra distance from inserting node at a given position */
     private double computeInsertionCost(Route route, int position, Node node) {
         Instance inst = route.getInstance();
         Node depot = inst.getDepot();
