@@ -6,27 +6,12 @@ import java.util.Set;
 /**
  * Greedy Constructive Heuristic for CTOP-T-Sync.
  *
- * Builds an initial feasible solution (without transfers) using a
- * Best Insertion Algorithm (BIA). At each iteration, the unserved
- * customer with the best insertion score is inserted at its best
- * feasible position across all routes.
- *
- * Inspired by:
- *   - Ben-Said et al. (2016): ratio-based BIA with adaptive weights
- *   - Tarantilis et al. (2013): parallel insertion favoring high-profit customers
- *   - Hammami et al. (2024): nearest neighbor initialization for HALNS
- *
- * Score function for inserting customer c at position p in route k:
- *
- *   score(c, p, k) = pc^α / ( (ΔL_cp / Tmax)^β  ×  (dc / Q)^γ )
- *
- * where:
- *   pc     = profit of customer c
- *   ΔL_cp  = extra distance from inserting c at position p
- *   dc     = demand of customer c
- *   α, β, γ = weights controlling profit, distance, capacity importance
- *
- * Higher score = better insertion candidate.
+ * Builds an initial feasible solution using a Best Insertion Algorithm (BIA).
+ * At each iteration, the unserved customer with the best insertion score is
+ * inserted at its best feasible position.
+ * * SPLIT DELIVERY UPGRADE: If a customer cannot fit into any single route,
+ * the heuristic pools the residual capacity of multiple routes to fulfill
+ * 100% of the demand via split deliveries.
  */
 public class GreedyConstructive {
 
@@ -37,38 +22,18 @@ public class GreedyConstructive {
 
     // ──────────────────────────── Constructor ────────────────────────────────
 
-    /**
-     * @param alphaWeight   profit exponent (higher = favor high-profit nodes)
-     * @param betaWeight    distance exponent (higher = penalize detours more)
-     * @param gammaWeight   capacity exponent (higher = penalize heavy demands)
-     */
-    public GreedyConstructive(double alphaWeight, double betaWeight,
-                              double gammaWeight) {
+    public GreedyConstructive(double alphaWeight, double betaWeight, double gammaWeight) {
         this.alphaWeight = alphaWeight;
         this.betaWeight = betaWeight;
         this.gammaWeight = gammaWeight;
     }
 
-    /** Default constructor with balanced weights */
     public GreedyConstructive() {
         this(1.0, 1.0, 0.5);
     }
 
     // ────────────────────────── Main Algorithm ───────────────────────────
 
-    /**
-     * Constructs an initial feasible solution (no transfers).
-     *
-     * Algorithm:
-     *   1. Initialize K empty routes (depot → depot)
-     *   2. Pre-filter: only consider customers within Tmax/2 radius of depot
-     *   3. Repeat until no feasible insertion exists:
-     *      a. For each unserved customer c:
-     *         - For each route k and each position p in k:
-     *           - If inserting c at (k, p) is feasible: compute score
-     *      b. Execute the insertion with the highest score
-     *   4. Return the solution
-     */
     public Solution construct(Instance instance) {
         Solution solution = new Solution(instance);
 
@@ -111,12 +76,13 @@ public class GreedyConstructive {
             for (Node cand : candidates) {
                 if (served.contains(cand.getId())) continue;
 
-                // Try inserting in each route at each position
+                // ---------------------------------------------------------
+                // PHASE 1: Try standard SINGLE-ROUTE insertion first
+                // ---------------------------------------------------------
                 for (Route route : solution.getRoutes()) {
-                    int maxPos = route.size() + 1; // can insert at 0..size (before any stop or at end)
+                    int maxPos = route.size() + 1;
 
                     for (int pos = 0; pos < maxPos; pos++) {
-                        // Quick feasibility check
                         RouteStop newStop = RouteStop.serve(cand);
                         if (route.canInsert(pos, newStop)) {
                             double score = computeScore(cand, route, pos, instance);
@@ -126,12 +92,70 @@ public class GreedyConstructive {
                         }
                     }
                 }
+
+                // ---------------------------------------------------------
+                // PHASE 2: Try SPLIT-DELIVERY if single-route failed
+                // ---------------------------------------------------------
+                if (best == null) {
+                    List<Route> splitRoutes = new ArrayList<>();
+                    List<Integer> splitPositions = new ArrayList<>();
+                    List<Double> splitQuantities = new ArrayList<>();
+                    double accumulated = 0.0;
+                    double aggregateScore = 0.0;
+
+                    for (Route route : solution.getRoutes()) {
+                        if (accumulated >= cand.getDemand() - 1e-6) break; // Demand fulfilled!
+
+                        double remCap = route.getRemainingCapacity();
+                        if (remCap <= 0) continue;
+
+                        double qty = Math.min(remCap, cand.getDemand() - accumulated);
+                        int bestPos = -1;
+                        double bestPosScore = -1;
+
+                        // Find the best position for this partial quantity in this route
+                        for (int pos = 0; pos <= route.size(); pos++) {
+                            if (route.canInsert(pos, RouteStop.servePartial(cand, qty))) {
+                                double score = computeScore(cand, route, pos, instance);
+                                if (score > bestPosScore) {
+                                    bestPosScore = score;
+                                    bestPos = pos;
+                                }
+                            }
+                        }
+
+                        // If a valid position was found in this route, add it to the pool
+                        if (bestPos != -1) {
+                            splitRoutes.add(route);
+                            splitPositions.add(bestPos);
+                            splitQuantities.add(qty);
+                            accumulated += qty;
+                            aggregateScore += bestPosScore;
+                        }
+                    }
+
+                    // Only accept the split plan if it successfully pooled enough capacity
+                    // to hit 100% of the demand (respecting the all-or-nothing rule)
+                    if (Math.abs(accumulated - cand.getDemand()) < 1e-6 && splitRoutes.size() > 1) {
+                        double finalSplitScore = aggregateScore / splitRoutes.size(); // Average score
+                        if (best == null || finalSplitScore > best.score) {
+                            best = new InsertionCandidate(cand, splitRoutes, splitPositions, splitQuantities, finalSplitScore);
+                        }
+                    }
+                }
             }
 
-            // Execute best insertion
+            // ---------------------------------------------------------
+            // EXECUTE the best insertion (Works for both Single and Split)
+            // ---------------------------------------------------------
             if (best != null) {
-                best.route.insertStop(best.position, RouteStop.serve(best.node));
-                best.route.evaluate();
+                for (int i = 0; i < best.routes.size(); i++) {
+                    Route r = best.routes.get(i);
+                    // Use servePartial. If it's a single route, best.quantities.get(i) is exactly the full demand
+                    RouteStop stop = RouteStop.servePartial(best.node, best.quantities.get(i));
+                    r.insertStop(best.positions.get(i), stop);
+                    r.evaluate();
+                }
                 insertionCount++;
                 improved = true;
 
@@ -142,7 +166,7 @@ public class GreedyConstructive {
             }
         }
 
-        // Evaluate all routes
+        // Evaluate all routes at the end to finalize arrival times
         for (Route r : solution.getRoutes()) {
             r.evaluate();
         }
@@ -157,83 +181,73 @@ public class GreedyConstructive {
 
     // ──────────────────────────── Scoring Function ───────────────────────────
 
-    /**
-     * Computes the insertion score for placing customer c at position pos in route.
-     *
-     * score = profit^α / ( (ΔL/Tmax)^β × (demand/Q)^γ )
-     *
-     * ΔL is the extra distance caused by the insertion:
-     *   ΔL = dist(prev, c) + dist(c, next) - dist(prev, next)
-     *
-     * Higher score = better candidate.
-     */
     private double computeScore(Node cand, Route route, int position, Instance instance) {
-        // Determine prev and next nodes around insertion point
         Node depot = instance.getDepot();
         Node prev, next;
-
         List<RouteStop> stops = route.getStops();
 
         if (stops.isEmpty()) {
-            // Empty route: depot → cand → depot
             prev = depot;
             next = depot;
         } else if (position == 0) {
-            // Insert before first stop: depot → cand → stops[0]
             prev = depot;
             next = stops.get(0).getNode();
         } else if (position == stops.size()) {
-            // Insert after last stop: stops[last] → cand → depot
             prev = stops.get(stops.size() - 1).getNode();
             next = depot;
         } else {
-            // Insert between stops[position-1] and stops[position]
             prev = stops.get(position - 1).getNode();
             next = stops.get(position).getNode();
         }
 
-        // Extra distance (detour cost)
         double deltaL = instance.getDistance(prev, cand)
                 + instance.getDistance(cand, next)
                 - instance.getDistance(prev, next);
 
-        // Normalize components
         double profitNorm = cand.getProfit();
         double distNorm = deltaL / instance.getMaxRouteDuration();
         double capNorm = cand.getDemand() / instance.getMaxCapacity();
 
-        // Avoid division by zero
         double epsilon = 1e-6;
         distNorm = Math.max(distNorm, epsilon);
         capNorm = Math.max(capNorm, epsilon);
 
-        // Score: higher is better
-        double score = Math.pow(profitNorm, alphaWeight)
+        return Math.pow(profitNorm, alphaWeight)
                 / (Math.pow(distNorm, betaWeight) * Math.pow(capNorm, gammaWeight));
-
-        return score;
     }
 
     // ──────────────────────────── Helper Class ───────────────────────────────
 
-    /** Stores a candidate insertion (node, route, position, score) */
+    /** Stores a candidate insertion (node, routes, positions, quantities, score) */
     private static class InsertionCandidate {
         final Node node;
-        final Route route;
-        final int position;
+        final List<Route> routes = new ArrayList<>();
+        final List<Integer> positions = new ArrayList<>();
+        final List<Double> quantities = new ArrayList<>();
         final double score;
 
+        // Backward-compatible constructor for standard single-route insertion
         InsertionCandidate(Node node, Route route, int position, double score) {
             this.node = node;
-            this.route = route;
-            this.position = position;
+            this.routes.add(route);
+            this.positions.add(position);
+            this.quantities.add(node.getDemand());
+            this.score = score;
+        }
+
+        // New constructor for split delivery insertion
+        InsertionCandidate(Node node, List<Route> routes, List<Integer> positions, List<Double> quantities, double score) {
+            this.node = node;
+            this.routes.addAll(routes);
+            this.positions.addAll(positions);
+            this.quantities.addAll(quantities);
             this.score = score;
         }
 
         @Override
         public String toString() {
-            return String.format("Insert node %d at pos %d in route v%d (score=%.2f)",
-                    node.getId(), position, route.getVehicleId(), score);
+            return String.format("Insert node %d into %d route(s) (score=%.2f)",
+                    node.getId(), routes.size(), score);
         }
     }
 }

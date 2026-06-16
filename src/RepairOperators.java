@@ -34,21 +34,29 @@ public class RepairOperators {
      */
     public int apply(int operatorIndex, Solution solution, List<Node> removedNodes) {
         // Build the full candidate pool: removed nodes + already unserved nodes
-        Set<Integer> served = solution.getServedNodeIds();
+        // Calculate how much demand is currently met for each customer
+        Map<Integer, Double> totalDelivery = new HashMap<>();
+        for (Route r : solution.getRoutes()) {
+            for (RouteStop s : r.getStops()) {
+                if (s.isServed()) totalDelivery.merge(s.getNode().getId(), s.getDeliveryQty(), Double::sum);
+            }
+        }
+
         List<Node> candidates = new ArrayList<>();
 
-        // Add removed nodes first (priority)
+        // Add removed nodes first (if they are missing demand)
         for (Node n : removedNodes) {
-            if (!served.contains(n.getId())) {
+            if (totalDelivery.getOrDefault(n.getId(), 0.0) < n.getDemand() - 1e-6) {
                 candidates.add(n);
             }
         }
 
-        // Add other unserved nodes
+        // Add other nodes missing demand
         for (Node n : solution.getInstance().getNodes()) {
-            if (!n.isDepot() && !served.contains(n.getId())
-                    && !containsNode(candidates, n.getId())) {
-                candidates.add(n);
+            if (!n.isDepot() && !containsNode(candidates, n.getId())) {
+                if (totalDelivery.getOrDefault(n.getId(), 0.0) < n.getDemand() - 1e-6) {
+                    candidates.add(n);
+                }
             }
         }
 

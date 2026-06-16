@@ -2,16 +2,6 @@ import java.util.*;
 
 /**
  * Represents a complete solution to the CTOP-T-Sync problem.
- *
- * Supports two modes:
- *   1. CTOP mode: each customer served by at most one vehicle
- *   2. SD-CTOP mode: split deliveries allowed (a customer can be served
- *      by multiple vehicles with partial demand). The Transform operator
- *      converts SD-CTOP solutions to CTOP-T-Sync solutions with transfers.
- *
- * Objective function:
- *   max Z = Σ pj · zjk   (maximize total collected profit)
- *   Note: profit is collected ONCE per customer, even if served by multiple routes.
  */
 public class Solution {
 
@@ -19,15 +9,12 @@ public class Solution {
     private final List<Route> routes;
     private final List<Transfer> transfers;
 
-    // ──────────────────────────── Constructors ───────────────────────────────
-
     public Solution(Instance instance) {
         this.instance = instance;
         this.routes = new ArrayList<>();
         this.transfers = new ArrayList<>();
     }
 
-    /** Deep copy constructor */
     public Solution(Solution other) {
         this.instance = other.instance;
         this.routes = new ArrayList<>();
@@ -37,7 +24,6 @@ public class Solution {
         this.transfers = new ArrayList<>(other.transfers);
     }
 
-    /** Restore this solution's state from another (rollback support) */
     public void restoreFrom(Solution other) {
         this.routes.clear();
         for (Route r : other.routes) {
@@ -49,29 +35,66 @@ public class Solution {
 
     // ──────────────────────────── Objective Function ─────────────────────────
 
-    /** Objective value = total collected profit (each customer counted once) */
-    public double getObjectiveValue() {
-        return getTotalProfit();
-    }
-
-    /**
-     * Total profit from served customers.
-     * Each customer's profit counted ONCE even if split across multiple routes.
+    /** * Calculates the ALNS objective value.
+     * Enforces "All-or-Nothing" constraint: heavily penalizes partial service.
      */
-    public double getTotalProfit() {
-        Set<Integer> counted = new HashSet<>();
-        double profit = 0;
+    /** Objective value = total collected profit minus penalties for partial service */
+    public double getObjectiveValue() {
+        double objective = getTotalProfit();
+
+        // Add "All-or-Nothing" penalty for split deliveries that don't meet full demand
+        Map<Integer, Double> totalDelivery = new HashMap<>();
+        Map<Integer, Double> customerDemand = new HashMap<>();
+
         for (Route r : routes) {
             for (RouteStop s : r.getStops()) {
-                if (s.isServed() && counted.add(s.getNode().getId())) {
-                    profit += s.getNode().getProfit();
+                if (s.isServed()) {
+                    int nid = s.getNode().getId();
+                    totalDelivery.merge(nid, s.getDeliveryQty(), Double::sum);
+                    customerDemand.put(nid, s.getNode().getDemand());
                 }
+            }
+        }
+
+        for (Map.Entry<Integer, Double> e : totalDelivery.entrySet()) {
+            double delivered = e.getValue();
+            double demand = customerDemand.get(e.getKey());
+            // If the demand is only partially fulfilled, apply a severe penalty
+            if (Math.abs(delivered - demand) > 1e-6) {
+                objective -= 10000.0 * Math.abs(demand - delivered);
+            }
+        }
+        return objective;
+    }
+
+    /** * Returns the true profit of the solution (without mathematical penalties).
+     * Only counts customers whose demand is FULLY met.
+     */
+    public double getTotalProfit() {
+        Map<Integer, Double> totalDelivery = new HashMap<>();
+        Map<Integer, Double> customerDemand = new HashMap<>();
+        Map<Integer, Double> customerProfit = new HashMap<>();
+
+        for (Route r : routes) {
+            for (RouteStop s : r.getStops()) {
+                if (s.isServed()) {
+                    int nid = s.getNode().getId();
+                    totalDelivery.merge(nid, s.getDeliveryQty(), Double::sum);
+                    customerDemand.putIfAbsent(nid, s.getNode().getDemand());
+                    customerProfit.putIfAbsent(nid, s.getNode().getProfit());
+                }
+            }
+        }
+
+        double profit = 0;
+        for (Map.Entry<Integer, Double> e : totalDelivery.entrySet()) {
+            if (Math.abs(e.getValue() - customerDemand.get(e.getKey())) < 1e-6) {
+                profit += customerProfit.get(e.getKey());
             }
         }
         return profit;
     }
 
-    /** Sum of distances across all routes */
     public double getTotalDistance() {
         double dist = 0;
         for (Route r : routes) {
@@ -82,13 +105,9 @@ public class Solution {
 
     // ──────────────────────────── Feasibility ────────────────────────────────
 
-    /**
-     * Complete feasibility check for CTOP-T-Sync mode (after Transform).
-     */
     public FeasibilityReport checkFeasibility() {
         FeasibilityReport report = new FeasibilityReport();
 
-        // 1. Route-level feasibility (time + capacity)
         for (Route r : routes) {
             r.evaluate();
             if (!r.isFeasible()) {
@@ -99,16 +118,12 @@ public class Solution {
             }
         }
 
-        // 2. Each customer served at most once (constraint 5) — standard CTOP mode
-        //    In SD-CTOP mode, multiple routes can serve same customer (split delivery)
         Set<Integer> servedNodes = new HashSet<>();
         for (Route r : routes) {
             for (RouteStop s : r.getStops()) {
                 if (s.isServed()) {
                     int nodeId = s.getNode().getId();
                     if (!servedNodes.add(nodeId)) {
-                        // Check if this is a split delivery (allowed in SD mode)
-                        // In final CTOP-T-Sync mode, this would be a violation
                         report.addViolation("Constraint 5 violated: node "
                                 + nodeId + " served by multiple vehicles");
                     }
@@ -116,32 +131,25 @@ public class Solution {
             }
         }
 
-        // 3. Transfer conservation at each node (constraint 10)
         checkTransferConservation(report);
 
-        // 4. Synchronization window (constraint 17)
         for (Transfer t : transfers) {
             try {
                 Route giverRoute = getRouteByVehicleId(t.getGivingVehicleId());
                 Route receiverRoute = getRouteByVehicleId(t.getReceivingVehicleId());
 
                 if (!giverRoute.visitsNode(t.getTransferNodeId())) {
-                    report.addViolation(String.format(
-                            "Stale transfer: giver v%d no longer visits node %d",
-                            t.getGivingVehicleId(), t.getTransferNodeId()));
+                    report.addViolation(String.format("Stale transfer: giver v%d no longer visits node %d", t.getGivingVehicleId(), t.getTransferNodeId()));
                     continue;
                 }
                 if (!receiverRoute.visitsNode(t.getTransferNodeId())) {
-                    report.addViolation(String.format(
-                            "Stale transfer: receiver v%d no longer visits node %d",
-                            t.getReceivingVehicleId(), t.getTransferNodeId()));
+                    report.addViolation(String.format("Stale transfer: receiver v%d no longer visits node %d", t.getReceivingVehicleId(), t.getTransferNodeId()));
                     continue;
                 }
 
                 double giverTime = giverRoute.getArrivalTimeAtNode(t.getTransferNodeId());
                 double receiverTime = receiverRoute.getArrivalTimeAtNode(t.getTransferNodeId());
 
-                // DIRECTIONAL sync: giver(dropper) - receiver(picker) ≤ W
                 double syncGap = giverTime - receiverTime;
 
                 if (syncGap > instance.getSyncWindow() + 1e-6) {
@@ -151,28 +159,20 @@ public class Solution {
                             syncGap, t.getReceivingVehicleId(), receiverTime, instance.getSyncWindow()));
                 }
             } catch (Exception e) {
-                report.addViolation("Transfer check error at node " + t.getTransferNodeId()
-                        + ": " + e.getMessage());
+                report.addViolation("Transfer check error at node " + t.getTransferNodeId() + ": " + e.getMessage());
             }
         }
 
         return report;
     }
 
-    /** Shorthand: is the entire solution feasible? */
     public boolean isFeasible() {
         return checkFeasibility().isFeasible();
     }
 
-    /**
-     * Feasibility check allowing split deliveries (for SD-CTOP intermediate solutions).
-     * Same as checkFeasibility() but does NOT flag duplicate service as violation.
-     * Instead checks that total delivery across routes matches demand.
-     */
     public FeasibilityReport checkFeasibilitySD() {
         FeasibilityReport report = new FeasibilityReport();
 
-        // 1. Route-level feasibility
         for (Route r : routes) {
             r.evaluate();
             if (!r.isFeasible()) {
@@ -183,7 +183,6 @@ public class Solution {
             }
         }
 
-        // 2. Split delivery demand conservation: total delivery = demand for each served customer
         Map<Integer, Double> totalDelivery = new HashMap<>();
         Map<Integer, Double> customerDemand = new HashMap<>();
         for (Route r : routes) {
@@ -208,7 +207,6 @@ public class Solution {
         return report;
     }
 
-    /** Check constraint (10): at each node, Σ qpick = Σ qdrop */
     private void checkTransferConservation(FeasibilityReport report) {
         Map<Integer, Double> totalPickup = new HashMap<>();
         Map<Integer, Double> totalDropoff = new HashMap<>();
@@ -238,12 +236,7 @@ public class Solution {
 
     // ──────────────────────────── Split Delivery Queries ─────────────────────
 
-    /**
-     * Returns customers currently served by multiple routes (split deliveries).
-     * Each entry: nodeId → list of (routeIndex, deliveryQty).
-     */
     public Map<Integer, List<int[]>> getSplitCustomers() {
-        // Map: nodeId → list of [routeIndex, vehicleId]
         Map<Integer, List<int[]>> visitMap = new HashMap<>();
 
         for (int ri = 0; ri < routes.size(); ri++) {
@@ -257,7 +250,6 @@ public class Solution {
             }
         }
 
-        // Filter to only those served by 2+ routes
         Map<Integer, List<int[]>> splits = new HashMap<>();
         for (Map.Entry<Integer, List<int[]>> e : visitMap.entrySet()) {
             if (e.getValue().size() > 1) {
@@ -267,19 +259,9 @@ public class Solution {
         return splits;
     }
 
-    /**
-     * Get the residual capacity of a route at a specific stop position.
-     * This is the remaining capacity the vehicle has when it arrives at that position.
-     * z_jk in Aguayo's notation.
-     */
     public double getResidualCapacity(Route route, int stopIndex) {
         route.evaluate();
-        // Arc load before the stop = load on arc entering this stop
         double loadBeforeStop = route.getArcLoad(stopIndex);
-        // Residual = Q - load before stop + what this stop consumes (because consumption hasn't happened yet)
-        // Actually, arcLoad[i] = load on arc (stop[i-1] → stop[i]) for i>=1, arcLoad[0] = load on arc (depot → stop[0])
-        // The load entering stop[stopIndex] is arcLoad[stopIndex]
-        // Residual capacity at this point = Q - arcLoad[stopIndex]
         return instance.getMaxCapacity() - loadBeforeStop;
     }
 
@@ -292,7 +274,6 @@ public class Solution {
         throw new IllegalArgumentException("Vehicle " + vehicleId + " not found");
     }
 
-    /** Set of all customer node IDs currently being served (across all routes) */
     public Set<Integer> getServedNodeIds() {
         Set<Integer> served = new HashSet<>();
         for (Route r : routes) {
@@ -303,7 +284,6 @@ public class Solution {
         return served;
     }
 
-    /** List of all customer nodes NOT yet served */
     public List<Node> getUnservedNodes() {
         Set<Integer> served = getServedNodeIds();
         List<Node> unserved = new ArrayList<>();
@@ -327,10 +307,6 @@ public class Solution {
     public void removeTransfer(Transfer t) { transfers.remove(t); }
     public void clearTransfers()           { transfers.clear(); }
 
-    /**
-     * Removes any Transfer objects that reference nodes no longer present
-     * in the corresponding vehicle's route. Also reverts orphaned stops.
-     */
     public void cleanupStaleTransfers() {
         Iterator<Transfer> it = transfers.iterator();
         Set<Integer> validTransferNodes = new HashSet<>();
@@ -366,6 +342,56 @@ public class Solution {
                 }
             }
             if (changed) r.evaluate();
+        }
+    }
+
+
+    /**
+     * Sweeps through the solution and completely removes any customer
+     * whose demand was only partially fulfilled. Restores feasibility.
+     */
+    public void cleanupPartialDeliveries() {
+        // 1. Calculate total deliveries
+        Map<Integer, Double> totalDelivery = new HashMap<>();
+        Map<Integer, Double> customerDemand = new HashMap<>();
+
+        for (Route r : routes) {
+            for (RouteStop s : r.getStops()) {
+                if (s.isServed()) {
+                    int nid = s.getNode().getId();
+                    totalDelivery.merge(nid, s.getDeliveryQty(), Double::sum);
+                    customerDemand.put(nid, s.getNode().getDemand());
+                }
+            }
+        }
+
+        // 2. Identify broken customers
+        Set<Integer> brokenCustomers = new HashSet<>();
+        for (Map.Entry<Integer, Double> e : totalDelivery.entrySet()) {
+            double delivered = e.getValue();
+            double demand = customerDemand.get(e.getKey());
+
+            // If delivered is greater than 0 but less than full demand
+            if (delivered > 1e-6 && Math.abs(delivered - demand) > 1e-6) {
+                brokenCustomers.add(e.getKey());
+            }
+        }
+
+        // 3. Remove all stops belonging to broken customers
+        if (!brokenCustomers.isEmpty()) {
+            for (Route r : routes) {
+                boolean routeChanged = false;
+                for (int i = r.getStops().size() - 1; i >= 0; i--) {
+                    RouteStop stop = r.getStops().get(i);
+                    if (stop.isServed() && brokenCustomers.contains(stop.getNode().getId())) {
+                        r.removeStop(i);
+                        routeChanged = true;
+                    }
+                }
+                if (routeChanged) {
+                    r.evaluate();
+                }
+            }
         }
     }
 
@@ -433,8 +459,6 @@ public class Solution {
 
         return sb.toString();
     }
-
-    // ──────────────────────────── Inner Class ────────────────────────────────
 
     public static class FeasibilityReport {
         private final List<String> violations = new ArrayList<>();

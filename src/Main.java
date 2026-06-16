@@ -14,10 +14,10 @@ public class Main {
 
     public static void main(String[] args) throws Exception {
 
-        String instanceFolder = "C:/Users/beste/Desktop/THESIS/VRP-T/Gurobi/Datasets/all";
+        String instanceFolder = "C:/Users/beste/Desktop/THESIS/VRP-T/Gurobi/Datasets/archetti_original_2/sub/hard";
         String outputCsv      = "experiment_results_restart.csv";
         int    alnsIterations  = 10000;
-        double syncWindow      = 15.0;
+        double syncWindow      = 0;
         long[] seeds           = {16, 42L, 123L, 7L, 15};
 
         if (args.length >= 1) instanceFolder = args[0];

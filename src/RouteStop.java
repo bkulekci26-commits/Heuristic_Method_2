@@ -2,18 +2,15 @@
  * Represents a single stop in a vehicle's route.
  *
  * Maps directly to the MIP decision variables:
- *   - served   ↔ zjk : customer j is served (demand fulfilled, profit collected)
- *   - pickup   ↔ pjk : vehicle k picks up transferred load at node j
- *   - dropoff  ↔ rjk : vehicle k drops off load at node j for another vehicle
+ * - served   ↔ zjk : customer j is served (demand fulfilled, profit collected)
+ * - pickup   ↔ pjk : vehicle k picks up transferred load at node j
+ * - dropoff  ↔ rjk : vehicle k drops off load at node j for another vehicle
+ * - waitingTime ↔ wjk : time vehicle k waits at node j for synchronization
  *
  * Split Delivery Extension (Aguayo et al., 2025 adaptation):
- *   - deliveryQty : amount this route delivers to the customer
- *     In standard mode:  deliveryQty = node.demand (full service)
- *     In split mode:     deliveryQty = partial amount (split across routes)
- *
- * After Transform, split deliveries become transfers:
- *   - One route: served=true, deliveryQty=full demand, picks up transferred load
- *   - Other route: dropoff stop (drops off part of load for the serving route)
+ * - deliveryQty : amount this route delivers to the customer
+ * In standard mode:  deliveryQty = node.demand (full service)
+ * In split mode:     deliveryQty = partial amount (split across routes)
  */
 public class RouteStop {
 
@@ -26,49 +23,42 @@ public class RouteStop {
     private double pickupQty;       // q_pick_jk
     private double dropoffQty;      // q_drop_jk
     private double deliveryQty;     // how much demand this route delivers
+    private double waitingTime;     // wjk (explicit waiting time)
 
     // ──────────────────────────── Factory Methods ────────────────────────────
 
-    /** Standard service stop: vehicle delivers FULL demand and collects profit */
     public static RouteStop serve(Node node) {
         return new RouteStop(node, true, false, false, 0, 0, node.getDemand());
     }
 
-    /** Split-delivery service stop: vehicle delivers PARTIAL demand */
     public static RouteStop servePartial(Node node, double partialDemand) {
         return new RouteStop(node, true, false, false, 0, 0, partialDemand);
     }
 
-    /** Pickup-only stop: vehicle picks up load left by another vehicle */
     public static RouteStop pickup(Node node, double qty) {
         return new RouteStop(node, false, true, false, qty, 0, 0);
     }
 
-    /** Dropoff-only stop: vehicle leaves load for another vehicle to collect */
     public static RouteStop dropoff(Node node, double qty) {
         return new RouteStop(node, false, false, true, 0, qty, 0);
     }
 
-    /** Service + dropoff: serve customer AND leave extra load for transfer */
     public static RouteStop serveAndDropoff(Node node, double dropoffQty) {
         return new RouteStop(node, true, false, true, 0, dropoffQty, node.getDemand());
     }
 
-    /** Service + pickup: serve customer AND pick up transferred load */
     public static RouteStop serveAndPickup(Node node, double pickupQty) {
         return new RouteStop(node, true, true, false, pickupQty, 0, node.getDemand());
     }
 
     // ──────────────────────────── Constructors ──────────────────────────────
 
-    /** Backward-compatible constructor (deliveryQty = demand if served) */
     public RouteStop(Node node, boolean served, boolean pickup, boolean dropoff,
                      double pickupQty, double dropoffQty) {
         this(node, served, pickup, dropoff, pickupQty, dropoffQty,
                 served ? node.getDemand() : 0);
     }
 
-    /** Full constructor with deliveryQty */
     public RouteStop(Node node, boolean served, boolean pickup, boolean dropoff,
                      double pickupQty, double dropoffQty, double deliveryQty) {
         this.node = node;
@@ -78,6 +68,7 @@ public class RouteStop {
         this.pickupQty = pickupQty;
         this.dropoffQty = dropoffQty;
         this.deliveryQty = deliveryQty;
+        this.waitingTime = 0.0;
         validate();
     }
 
@@ -94,17 +85,11 @@ public class RouteStop {
 
     // ──────────────────────────── Load Computation ──────────────────────────
 
-    /**
-     * Net load consumed at this stop (from the vehicle's perspective).
-     * Positive = vehicle loses load, Negative = vehicle gains load.
-     *
-     * Uses deliveryQty instead of node.getDemand() to support split deliveries.
-     */
     public double getLoadConsumption() {
         double consumption = 0;
-        if (served) consumption += deliveryQty;     // deliver (partial or full) demand
-        consumption += dropoffQty;                   // leave load for transfer
-        consumption -= pickupQty;                    // gain load from transfer
+        if (served) consumption += deliveryQty;
+        consumption += dropoffQty;
+        consumption -= pickupQty;
         return consumption;
     }
 
@@ -117,9 +102,12 @@ public class RouteStop {
     public double getPickupQty()    { return pickupQty; }
     public double getDropoffQty()   { return dropoffQty; }
     public double getDeliveryQty()  { return deliveryQty; }
+    public double getWaitingTime()  { return waitingTime; }
 
     public void setServed(boolean s)       { this.served = s; validate(); }
     public void setDeliveryQty(double qty) { this.deliveryQty = qty; }
+    public void setWaitingTime(double w)   { this.waitingTime = Math.max(0, w); }
+
     public void setPickup(boolean p, double qty) {
         this.pickup = p;
         this.pickupQty = p ? qty : 0;
@@ -131,12 +119,10 @@ public class RouteStop {
         validate();
     }
 
-    /** Is this stop purely for transfer (not serving the customer)? */
     public boolean isTransferOnly() {
         return !served && (pickup || dropoff);
     }
 
-    /** Is this a split delivery (serving less than full demand)? */
     public boolean isSplitDelivery() {
         return served && deliveryQty < node.getDemand() - 1e-6;
     }
@@ -154,6 +140,7 @@ public class RouteStop {
         }
         if (pickup) sb.append(String.format("[P:%.1f]", pickupQty));
         if (dropoff) sb.append(String.format("[D:%.1f]", dropoffQty));
+        if (waitingTime > 0) sb.append(String.format("[W:%.1f]", waitingTime));
         return sb.toString();
     }
 }
