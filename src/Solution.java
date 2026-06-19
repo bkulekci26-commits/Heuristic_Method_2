@@ -67,6 +67,49 @@ public class Solution {
         return objective;
     }
 
+    /**
+     * Safety Net for ALNS: Sweeps through the solution and completely removes
+     * any customer whose demand was only partially fulfilled. Restores mathematical feasibility.
+     */
+    public void cleanupFailedSplits() {
+        Map<Integer, Double> totalDelivery = new HashMap<>();
+        Map<Integer, Double> customerDemand = new HashMap<>();
+
+        for (Route r : routes) {
+            for (RouteStop s : r.getStops()) {
+                if (s.isServed()) {
+                    int nid = s.getNode().getId();
+                    totalDelivery.merge(nid, s.getDeliveryQty(), Double::sum);
+                    customerDemand.put(nid, s.getNode().getDemand());
+                }
+            }
+        }
+
+        Set<Integer> brokenCustomers = new HashSet<>();
+        for (Map.Entry<Integer, Double> e : totalDelivery.entrySet()) {
+            double delivered = e.getValue();
+            double demand = customerDemand.get(e.getKey());
+            // If strictly between 0 and full demand, it is a broken split
+            if (delivered > 1e-6 && Math.abs(delivered - demand) > 1e-6) {
+                brokenCustomers.add(e.getKey());
+            }
+        }
+
+        if (!brokenCustomers.isEmpty()) {
+            for (Route r : routes) {
+                boolean routeChanged = false;
+                for (int i = r.getStops().size() - 1; i >= 0; i--) {
+                    RouteStop stop = r.getStops().get(i);
+                    if (stop.isServed() && brokenCustomers.contains(stop.getNode().getId())) {
+                        r.removeStop(i);
+                        routeChanged = true;
+                    }
+                }
+                if (routeChanged) r.evaluate();
+            }
+        }
+    }
+
     /** * Returns the true profit of the solution (without mathematical penalties).
      * Only counts customers whose demand is FULLY met.
      */

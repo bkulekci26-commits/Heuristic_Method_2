@@ -145,6 +145,7 @@ public class ALNSEngine {
             repairOps.apply(rOp, candidate, removed);
 
             // Clean up stale transfers
+            candidate.cleanupFailedSplits();
             candidate.cleanupStaleTransfers();
 
             // Evaluate
