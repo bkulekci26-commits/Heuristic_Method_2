@@ -171,10 +171,10 @@ public class GreedyConstructive {
             r.evaluate();
         }
 
-        System.out.printf("[Constructive] DONE: %d nodes served out of %d candidates%n",
-                insertionCount, candidates.size());
-        System.out.printf("[Constructive] Profit=%.1f, Distance=%.1f%n",
-                solution.getTotalProfit(), solution.getTotalDistance());
+//        System.out.printf("[Constructive] DONE: %d nodes served out of %d candidates%n",
+//                insertionCount, candidates.size());
+//        System.out.printf("[Constructive] Profit=%.1f, Distance=%.1f%n",
+//                solution.getTotalProfit(), solution.getTotalDistance());
 
         return solution;
     }

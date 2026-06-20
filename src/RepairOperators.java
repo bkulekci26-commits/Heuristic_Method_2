@@ -62,10 +62,6 @@ public class RepairOperators {
     // OPERATOR 0: GREEDY BEST INSERTION (Split-Aware)
     // ══════════════════════════════════════════════════════════
 
-// ══════════════════════════════════════════════════════════
-    // OPERATOR 0: GREEDY BEST INSERTION (Split-Aware)
-    // ══════════════════════════════════════════════════════════
-
     private int greedyBestInsertion(Solution solution, List<Node> candidates, Map<Integer, Double> totalDelivery) {
         Instance inst = solution.getInstance();
         int inserted = 0;
@@ -92,7 +88,6 @@ public class RepairOperators {
 
             if (best != null) {
                 executeInsertion(best);
-                // FIXED LINE: Use best.node instead of cand
                 totalDelivery.put(best.node.getId(), best.node.getDemand());
                 candidates.remove(bestCandIdx);
                 inserted++;
@@ -122,10 +117,6 @@ public class RepairOperators {
                 double missingDemand = cand.getDemand() - totalDelivery.getOrDefault(cand.getId(), 0.0);
                 if (missingDemand < 1e-6) continue;
 
-                // To calculate regret, we ideally need the best and second-best routes.
-                // For SD, we simplify: we just evaluate the best plan.
-                // A true Regret-2 for splits is highly complex, so we use a simplified regret:
-                // Regret = BestScore - (Average Score of other feasible single routes)
                 InsertionCandidate candBest = evaluateInsertion(cand, missingDemand, solution, inst);
                 if (candBest == null) continue;
 
@@ -257,9 +248,16 @@ public class RepairOperators {
                 }
             }
 
+            // Only accept if full demand can be met
             if (Math.abs(accumulated - missingDemand) < 1e-6 && splitRoutes.size() > 1) {
                 double avgScore = aggregateScore / splitRoutes.size();
-                best = new InsertionCandidate(cand, splitRoutes, splitPositions, splitQuantities, avgScore);
+
+                // --- THE SPLIT INCENTIVE ---
+                // We artificially multiply the score by 1.5. This forces the heuristic
+                // to aggressively explore split deliveries instead of ignoring them!
+                double splitMultiplier = 1.5;
+
+                best = new InsertionCandidate(cand, splitRoutes, splitPositions, splitQuantities, avgScore * splitMultiplier);
             }
         }
         return best;

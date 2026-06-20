@@ -146,11 +146,12 @@ public class Solution {
         return dist;
     }
 
-    // ──────────────────────────── Feasibility ────────────────────────────────
+// ──────────────────────────── Feasibility ────────────────────────────────
 
     public FeasibilityReport checkFeasibility() {
         FeasibilityReport report = new FeasibilityReport();
 
+        // 1. Check Route Time and Capacity Limits
         for (Route r : routes) {
             r.evaluate();
             if (!r.isFeasible()) {
@@ -161,38 +162,45 @@ public class Solution {
             }
         }
 
-        Set<Integer> servedNodes = new HashSet<>();
+        // 2. Check "All-or-Nothing" Split Delivery Demand Fulfillment
+        Map<Integer, Double> totalDelivery = new HashMap<>();
+        Map<Integer, Double> customerDemand = new HashMap<>();
         for (Route r : routes) {
             for (RouteStop s : r.getStops()) {
                 if (s.isServed()) {
-                    int nodeId = s.getNode().getId();
-                    if (!servedNodes.add(nodeId)) {
-                        report.addViolation("Constraint 5 violated: node "
-                                + nodeId + " served by multiple vehicles");
-                    }
+                    int nid = s.getNode().getId();
+                    totalDelivery.merge(nid, s.getDeliveryQty(), Double::sum);
+                    customerDemand.put(nid, s.getNode().getDemand());
                 }
             }
         }
+        for (Map.Entry<Integer, Double> e : totalDelivery.entrySet()) {
+            double delivered = e.getValue();
+            double demand = customerDemand.get(e.getKey());
+            // If the demand is partially met, it's a violation
+            if (Math.abs(delivered - demand) > 1e-6) {
+                report.addViolation(String.format(
+                        "SD demand mismatch at node %d: delivered=%.1f ≠ demand=%.1f",
+                        e.getKey(), delivered, demand));
+            }
+        }
 
+        // 3. Check Transfer Mass Conservation
         checkTransferConservation(report);
 
+        // 4. Check Temporal Synchronization (Waiting times and Time Windows)
         for (Transfer t : transfers) {
             try {
                 Route giverRoute = getRouteByVehicleId(t.getGivingVehicleId());
                 Route receiverRoute = getRouteByVehicleId(t.getReceivingVehicleId());
 
-                if (!giverRoute.visitsNode(t.getTransferNodeId())) {
-                    report.addViolation(String.format("Stale transfer: giver v%d no longer visits node %d", t.getGivingVehicleId(), t.getTransferNodeId()));
-                    continue;
-                }
-                if (!receiverRoute.visitsNode(t.getTransferNodeId())) {
-                    report.addViolation(String.format("Stale transfer: receiver v%d no longer visits node %d", t.getReceivingVehicleId(), t.getTransferNodeId()));
+                if (!giverRoute.visitsNode(t.getTransferNodeId()) || !receiverRoute.visitsNode(t.getTransferNodeId())) {
+                    report.addViolation("Stale transfer at node " + t.getTransferNodeId());
                     continue;
                 }
 
                 double giverTime = giverRoute.getArrivalTimeAtNode(t.getTransferNodeId());
                 double receiverTime = receiverRoute.getArrivalTimeAtNode(t.getTransferNodeId());
-
                 double syncGap = giverTime - receiverTime;
 
                 if (syncGap > instance.getSyncWindow() + 1e-6) {
@@ -202,7 +210,7 @@ public class Solution {
                             syncGap, t.getReceivingVehicleId(), receiverTime, instance.getSyncWindow()));
                 }
             } catch (Exception e) {
-                report.addViolation("Transfer check error at node " + t.getTransferNodeId() + ": " + e.getMessage());
+                report.addViolation("Transfer check error: " + e.getMessage());
             }
         }
 
