@@ -11,6 +11,14 @@ public class RepairOperators {
     private final Random rng;
     public static final int NUM_OPERATORS = 3;
 
+    /**
+     * Score boost applied to a split-delivery insertion relative to a single-route
+     * insertion. Lowered from the original 1.5 so that split deliveries no longer
+     * crowd out single-route insertions and transfer-enabled completions. Exposed
+     * as a tunable parameter (sweep e.g. {1.0, 1.1, 1.25, 1.5}).
+     */
+    public static double SPLIT_SCORE_MULTIPLIER = 1.1;
+
     public RepairOperators(Random rng) {
         this.rng = rng;
     }
@@ -253,11 +261,9 @@ public class RepairOperators {
                 double avgScore = aggregateScore / splitRoutes.size();
 
                 // --- THE SPLIT INCENTIVE ---
-                // We artificially multiply the score by 1.5. This forces the heuristic
-                // to aggressively explore split deliveries instead of ignoring them!
-                double splitMultiplier = 1.5;
-
-                best = new InsertionCandidate(cand, splitRoutes, splitPositions, splitQuantities, avgScore * splitMultiplier);
+                // Mild boost so split deliveries are explored but no longer dominate
+                // single-route insertions and transfer-enabled completions. Tunable.
+                best = new InsertionCandidate(cand, splitRoutes, splitPositions, splitQuantities, avgScore * SPLIT_SCORE_MULTIPLIER);
             }
         }
         return best;

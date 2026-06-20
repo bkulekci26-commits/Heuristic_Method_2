@@ -20,6 +20,7 @@ public class ExperimentRunner {
         results.add(new String[]{
                 "Instance", "Customers", "Vehicles", "Capacity_Q", "Time_Tmax", "Sync_W",
                 "Final_Profit", "Elapsed_ms", "Feasible", "Splits_Count", "Transfers_Count",
+                "Transfer_Attempts", "Transfer_Applied",
                 "Split_Details", "Transfer_Details"
         });
 
@@ -36,6 +37,7 @@ public class ExperimentRunner {
                 long t0 = System.currentTimeMillis();
                 Solution best = null;
                 double bestProfit = Double.NEGATIVE_INFINITY;
+                ALNSEngine bestEngine = null;
 
                 for (long s : seeds) {
                     ALNSEngine alns = new ALNSEngine(alnsIterations, s);
@@ -44,6 +46,7 @@ public class ExperimentRunner {
                     if (candidate.isFeasible() && candidate.getTotalProfit() > bestProfit) {
                         best = candidate;
                         bestProfit = candidate.getTotalProfit();
+                        bestEngine = alns;
                     }
                 }
 
@@ -54,7 +57,7 @@ public class ExperimentRunner {
                     results.add(new String[]{
                             fileName, String.valueOf(inst.getNumCustomers()), String.valueOf(inst.getMaxVehicles()),
                             String.valueOf(inst.getMaxCapacity()), String.valueOf(inst.getMaxRouteDuration()), String.valueOf(syncWindow),
-                            "0", String.valueOf(elapsed), "false", "0", "0", "None", "None"
+                            "0", String.valueOf(elapsed), "false", "0", "0", "0", "0", "None", "None"
                     });
                     System.out.printf("Profit: FAILED | Time: %4dms (No feasible solution found)\n", elapsed);
                     continue; // Skip the rest of the loop for this instance
@@ -84,11 +87,15 @@ public class ExperimentRunner {
                         String.valueOf(inst.getMaxCapacity()), String.valueOf(inst.getMaxRouteDuration()), String.valueOf(syncWindow),
                         String.valueOf(bestProfit), String.valueOf(elapsed), String.valueOf(best.isFeasible()),
                         String.valueOf(splits), String.valueOf(transfers),
+                        bestEngine != null ? String.valueOf(bestEngine.getTransferAttempts()) : "0",
+                        bestEngine != null ? String.valueOf(bestEngine.getTransferApplied()) : "0",
                         splitStr.toString().isEmpty() ? "None" : splitStr.toString(),
                         transferStr.toString().isEmpty() ? "None" : transferStr.toString()
                 });
 
-                System.out.printf("Profit: %6.0f | Splits: %d | Transfers: %d | Time: %4dms\n", bestProfit, splits, transfers, elapsed);
+                int txApplied = bestEngine != null ? bestEngine.getTransferApplied() : 0;
+                System.out.printf("Profit: %6.0f | Splits: %d | Transfers: %d (applied %d) | Time: %4dms\n",
+                        bestProfit, splits, transfers, txApplied, elapsed);
 
             } catch (Exception e) {
                 System.out.println("ERROR: " + e.getMessage());

@@ -25,6 +25,7 @@ public class ALNSEngine {
     private int[] repairUsageCounts;
 
     private int totalIterations, acceptedCount, newBestCount;
+    private int transferAttempts, transferApplied;
     private long elapsedMs;
 
     public ALNSEngine(int maxIterations, int segmentLength, double initTemperature, double coolingRate, double minTemperature, int betaMin, int betaMax, double reactionFactor, long seed) {
@@ -57,8 +58,9 @@ public class ALNSEngine {
 
         int iterWithoutImprovement = 0;
         int maxNoImprove = maxIterations / 3;
-        int transferInterval = Math.max(200, maxIterations / 25);
+        int transferInterval = Math.max(25, maxIterations / 200);
         acceptedCount = 0; newBestCount = 0;
+        transferAttempts = 0; transferApplied = 0;
 
         for (int iter = 0; iter < maxIterations; iter++) {
             int adjustedBetaMax = Math.max(betaMax, (int)(0.25 * admissibleSol.getNumServed()));
@@ -130,23 +132,27 @@ public class ALNSEngine {
 
             if (iter > 0 && iter % transferInterval == 0) {
                 Solution transferTest = new Solution(admissibleSol);
-                if (transformOperator.optimize(transferTest) > 0 && transferTest.isFeasible()) {
-                    localSearch.postInsert(transferTest);
-                    localSearch.improve(transferTest);
-                    localSearch.postInsert(transferTest);
-                    if (transferTest.isFeasible()) {
-                        double tProfit = transferTest.getTotalProfit();
-                        if (!transferTest.getTransfers().isEmpty() && tProfit > bestTransferProfit) {
-                            bestTransferSol = new Solution(transferTest);
-                            bestTransferProfit = tProfit;
-                        }
-                        if (tProfit > admissibleSol.getTotalProfit()) {
-                            admissibleSol = transferTest;
-                            if (tProfit > bestProfit) {
-                                bestSol = new Solution(transferTest);
-                                bestProfit = tProfit;
-                                newBestCount++; iterWithoutImprovement = 0;
-                            }
+                int beforeTransfers = transferTest.getTransfers().size();
+                transferAttempts++;
+                if (transformOperator.applyBestTransferMove(transferTest) && transferTest.isFeasible()) {
+                    transferApplied++;
+                    double tProfit = transferTest.getTotalProfit();
+                    double admP = admissibleSol.getTotalProfit();
+                    if (!transferTest.getTransfers().isEmpty() && tProfit >= bestTransferProfit) {
+                        bestTransferSol = new Solution(transferTest);
+                        bestTransferProfit = tProfit;
+                    }
+                    // Carry transfer structure forward: adopt if profit improves, or if it
+                    // ties but adds transfers (mirrors the acceptance bias above) so later
+                    // iterations can build on the transfer instead of discarding it.
+                    boolean carry = tProfit > admP
+                            || (tProfit >= admP - 1e-6 && transferTest.getTransfers().size() > beforeTransfers);
+                    if (carry) {
+                        admissibleSol = transferTest;
+                        if (tProfit > bestProfit) {
+                            bestSol = new Solution(transferTest);
+                            bestProfit = tProfit;
+                            newBestCount++; iterWithoutImprovement = 0;
                         }
                     }
                 }
@@ -220,6 +226,8 @@ public class ALNSEngine {
     public int getTotalIterations()  { return totalIterations; }
     public int getAcceptedCount()    { return acceptedCount; }
     public int getNewBestCount()     { return newBestCount; }
+    public int getTransferAttempts() { return transferAttempts; }
+    public int getTransferApplied()  { return transferApplied; }
     public long getElapsedMs()       { return elapsedMs; }
     public double getAcceptanceRate() { return totalIterations > 0 ? 100.0 * acceptedCount / totalIterations : 0; }
 }

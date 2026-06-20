@@ -17,6 +17,9 @@ public class Main {
         String instanceFolder = "C:/Users/beste/Desktop/THESIS/VRP-T/Gurobi/Datasets/archetti_original_2/sub";
         String outputCsv      = "heuristic_algorithm_cmt07.csv";
         int    alnsIterations  = 10000;
+        // NOTE: W = 0 forces the dropper to arrive at/before the picker (no waiting),
+        // which strongly suppresses feasible transfers. The real experiments use W > 0
+        // (picker may wait up to w); pass it as the 4th CLI arg, e.g. ... <iters> <W>.
         double syncWindow      = 0;
         long[] seeds           = {16, 42L, 123L, 7L, 15};
 

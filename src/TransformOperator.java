@@ -50,6 +50,53 @@ public class TransformOperator {
         return totalMoves;
     }
 
+    /**
+     * Attempts a SINGLE best transfer move (cross or reverse) and applies it if it
+     * is profit-positive and keeps the solution feasible. Lightweight alternative to
+     * {@link #optimize(Solution)} (no internal improvement loop, no time budget) so it
+     * can be invoked frequently inside the ALNS loop. Returns true iff a transfer was
+     * applied. On infeasibility the solution is restored.
+     */
+    public boolean applyBestTransferMove(Solution solution) {
+        Solution backup = new Solution(solution);
+        long now = System.currentTimeMillis();
+        Move a = findBestCrossTransfer(solution, now);
+        Move b = findBestReverseTransfer(solution, now);
+
+        Move best = null;
+        if (a != null && (best == null || a.netProfit > best.netProfit)) best = a;
+        if (b != null && (best == null || b.netProfit > best.netProfit)) best = b;
+        if (best == null || best.netProfit <= 1e-6) return false;
+
+        applyMove(solution, best);
+        for (Route r : solution.getRoutes()) r.evaluate();
+        if (!solution.isFeasible()) {
+            solution.restoreFrom(backup);
+            for (Route r : solution.getRoutes()) r.evaluate();
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Unserved customers that NO single route can take by a plain direct insertion
+     * (capacity or duration). These are exactly the customers a transfer can uniquely
+     * help with — if a customer fits directly somewhere, a transfer is never the
+     * cheaper way to serve it. Focusing the transfer search here targets the
+     * "reachability" niche that split delivery cannot fill and avoids wasted work.
+     */
+    private List<Node> unservedNotDirectlyInsertable(Solution sol) {
+        List<Node> result = new ArrayList<>();
+        for (Node u : sol.getUnservedNodes()) {
+            boolean insertable = false;
+            for (Route r : sol.getRoutes()) {
+                if (findBestFeasiblePos(new Route(r), u, sol.getInstance()) >= 0) { insertable = true; break; }
+            }
+            if (!insertable) result.add(u);
+        }
+        return result;
+    }
+
     private Move findBestDirectInsert(Solution sol) {
         Move best = null;
         for (Node u : sol.getUnservedNodes()) {
@@ -93,7 +140,7 @@ public class TransformOperator {
 
     private Move findBestCrossTransfer(Solution sol, long startTime) {
         Instance inst = sol.getInstance(); double W = inst.getSyncWindow();
-        List<Route> routes = sol.getRoutes(); List<Node> unserved = sol.getUnservedNodes();
+        List<Route> routes = sol.getRoutes(); List<Node> unserved = unservedNotDirectlyInsertable(sol);
         Move best = null; unserved.sort((a, b) -> Double.compare(b.getProfit(), a.getProfit()));
 
         for (int i1 = 0; i1 < routes.size(); i1++) {
@@ -149,7 +196,7 @@ public class TransformOperator {
 
     private Move findBestReverseTransfer(Solution sol, long startTime) {
         Instance inst = sol.getInstance(); double W = inst.getSyncWindow();
-        List<Route> routes = sol.getRoutes(); List<Node> unserved = sol.getUnservedNodes();
+        List<Route> routes = sol.getRoutes(); List<Node> unserved = unservedNotDirectlyInsertable(sol);
         Move best = null; unserved.sort((a, b) -> Double.compare(b.getProfit(), a.getProfit()));
 
         for (int i2 = 0; i2 < routes.size(); i2++) {
