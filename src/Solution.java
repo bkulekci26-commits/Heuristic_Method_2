@@ -388,7 +388,9 @@ public class Solution {
                     changed = true;
                 } else if (stop.isServed() && (stop.isPickup() || stop.isDropoff())
                         && !validTransferNodes.contains(nodeId)) {
-                    r.getStops().set(i, RouteStop.serve(stop.getNode()));
+                    // FIX: Preserve the existing deliveryQty if it's a split delivery!
+                    RouteStop cleanStop = RouteStop.servePartial(stop.getNode(), stop.getDeliveryQty());
+                    r.getStops().set(i, cleanStop);
                     changed = true;
                 }
             }

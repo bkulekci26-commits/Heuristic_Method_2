@@ -57,7 +57,6 @@ public class ALNSEngine {
 
         int iterWithoutImprovement = 0;
         int maxNoImprove = maxIterations / 3;
-        int transferInterval = Math.max(200, maxIterations / 25);
         acceptedCount = 0; newBestCount = 0;
 
         for (int iter = 0; iter < maxIterations; iter++) {
@@ -69,6 +68,17 @@ public class ALNSEngine {
 
             Solution candidate = new Solution(admissibleSol);
             List<Node> removed = destroyOps.apply(dOp, candidate, beta);
+
+            // ════════════════════════════════════════════════════════════════
+            // THE SLACK INJECTION FIX:
+            // Run the TransformOperator NOW! The routes just had nodes deleted,
+            // meaning they have massive amounts of free time and capacity to
+            // easily fit a transfer before the Repair Operators fill them back up!
+            // ════════════════════════════════════════════════════════════════
+            if (rng.nextDouble() < 0.10) { // 25% chance to seek transfers during slack
+                transformOperator.optimize(candidate);
+            }
+
             repairOps.apply(rOp, candidate, removed);
 
             candidate.cleanupFailedSplits();
@@ -85,15 +95,16 @@ public class ALNSEngine {
             double candProfit = candidate.getTotalProfit();
             double admProfit = admissibleSol.getTotalProfit();
             double delta = candProfit - admProfit;
+
             boolean accepted = delta > 0 || (temperature > minTemperature && rng.nextDouble() < Math.exp(delta / temperature));
 
+            // THE TRANSFER SUBSIDY
             if (!accepted) {
                 if (candidate.getTransfers().size() > admissibleSol.getTransfers().size()) {
                     accepted = true;
-                } else if (candidate.getSplitCustomers().size() > admissibleSol.getSplitCustomers().size()) {
-                    accepted = true;
                 }
             }
+
             destroyUsageCounts[dOp]++; repairUsageCounts[rOp]++;
 
             if (accepted) {
@@ -110,12 +121,6 @@ public class ALNSEngine {
                 }
 
                 if (candProfit > bestProfit) {
-                    Solution preTransfer = new Solution(admissibleSol);
-                    transformOperator.optimize(admissibleSol);
-                    localSearch.postInsert(admissibleSol);
-                    if (!admissibleSol.isFeasible()) admissibleSol = preTransfer;
-                    candProfit = admissibleSol.getTotalProfit();
-
                     bestSol = new Solution(admissibleSol);
                     bestProfit = candProfit;
                     newBestCount++; iterWithoutImprovement = 0;
@@ -127,30 +132,6 @@ public class ALNSEngine {
                     }
                 } else { iterWithoutImprovement++; }
             } else { iterWithoutImprovement++; }
-
-            if (iter > 0 && iter % transferInterval == 0) {
-                Solution transferTest = new Solution(admissibleSol);
-                if (transformOperator.optimize(transferTest) > 0 && transferTest.isFeasible()) {
-                    localSearch.postInsert(transferTest);
-                    localSearch.improve(transferTest);
-                    localSearch.postInsert(transferTest);
-                    if (transferTest.isFeasible()) {
-                        double tProfit = transferTest.getTotalProfit();
-                        if (!transferTest.getTransfers().isEmpty() && tProfit > bestTransferProfit) {
-                            bestTransferSol = new Solution(transferTest);
-                            bestTransferProfit = tProfit;
-                        }
-                        if (tProfit > admissibleSol.getTotalProfit()) {
-                            admissibleSol = transferTest;
-                            if (tProfit > bestProfit) {
-                                bestSol = new Solution(transferTest);
-                                bestProfit = tProfit;
-                                newBestCount++; iterWithoutImprovement = 0;
-                            }
-                        }
-                    }
-                }
-            }
 
             temperature = Math.max(temperature * coolingRate, minTemperature);
             updateWeightsIfSegmentEnd(iter);
@@ -215,8 +196,7 @@ public class ALNSEngine {
         }
     }
 
-    public void printReport(Solution bestSol) { } // Keeping omitted for brevity (doesn't span console)
-
+    public void printReport(Solution bestSol) { }
     public int getTotalIterations()  { return totalIterations; }
     public int getAcceptedCount()    { return acceptedCount; }
     public int getNewBestCount()     { return newBestCount; }

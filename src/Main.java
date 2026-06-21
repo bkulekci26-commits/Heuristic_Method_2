@@ -14,11 +14,11 @@ public class Main {
 
     public static void main(String[] args) throws Exception {
 
-        String instanceFolder = "C:/Users/beste/Desktop/THESIS/VRP-T/Gurobi/Datasets/archetti_original_2/sub";
-        String outputCsv      = "heuristic_algorithm_cmt07.csv";
+        String instanceFolder = "C:/Users/beste/Desktop/THESIS/VRP-T/Gurobi/Datasets/archetti_original_2/sub/hard";
+        String outputCsv      = "heuristic_algorithm_cmt16_3.csv";
         int    alnsIterations  = 10000;
-        double syncWindow      = 0;
-        long[] seeds           = {16, 42L, 123L, 7L, 15};
+        double syncWindow      = 100;
+        long[] seeds           = {2001, 12, 7, 26, 33};
 
         if (args.length >= 1) instanceFolder = args[0];
         if (args.length >= 2) outputCsv      = args[1];

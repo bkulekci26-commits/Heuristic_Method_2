@@ -11,22 +11,18 @@ public class TransformOperator {
         Node transferNode; double transferQty;
     }
 
-    private static final long TIME_BUDGET_MS = 5000;
-
     public int optimize(Solution solution) {
         Solution backup = new Solution(solution);
         int totalMoves = 0;
         boolean improved = true;
-        long startTime = System.currentTimeMillis();
 
         while (improved) {
             improved = false;
-            if (System.currentTimeMillis() - startTime > TIME_BUDGET_MS) break;
 
             Move bestDirect = findBestDirectInsert(solution);
             Move bestSwap = findBestSingleSwap(solution);
-            Move bestTransferA = findBestCrossTransfer(solution, startTime);
-            Move bestTransferB = findBestReverseTransfer(solution, startTime);
+            Move bestTransferA = findBestCrossTransfer(solution);
+            Move bestTransferB = findBestReverseTransfer(solution);
 
             Move best = null;
             if (bestDirect != null && (best == null || bestDirect.netProfit > best.netProfit)) best = bestDirect;
@@ -50,9 +46,16 @@ public class TransformOperator {
         return totalMoves;
     }
 
+    private List<Node> getTopUnserved(Solution sol, int limit) {
+        List<Node> unserved = sol.getUnservedNodes();
+        unserved.sort((a, b) -> Double.compare(b.getProfit(), a.getProfit()));
+        if (unserved.size() > limit) return unserved.subList(0, limit);
+        return unserved;
+    }
+
     private Move findBestDirectInsert(Solution sol) {
         Move best = null;
-        for (Node u : sol.getUnservedNodes()) {
+        for (Node u : getTopUnserved(sol, 15)) {
             for (int ri = 0; ri < sol.getRoutes().size(); ri++) {
                 Route route = sol.getRoutes().get(ri);
                 for (int pos = 0; pos <= route.size(); pos++) {
@@ -76,7 +79,7 @@ public class TransformOperator {
                 RouteStop stop = route.getStops().get(si);
                 if (!stop.isServed()) continue;
 
-                for (Node u : sol.getUnservedNodes()) {
+                for (Node u : getTopUnserved(sol, 15)) {
                     double netProfit = u.getProfit() - stop.getNode().getProfit();
                     if (netProfit <= 0) continue;
                     Route copy = new Route(route); copy.removeStop(si);
@@ -91,18 +94,20 @@ public class TransformOperator {
         return best;
     }
 
-    private Move findBestCrossTransfer(Solution sol, long startTime) {
-        Instance inst = sol.getInstance(); double W = inst.getSyncWindow();
-        List<Route> routes = sol.getRoutes(); List<Node> unserved = sol.getUnservedNodes();
-        Move best = null; unserved.sort((a, b) -> Double.compare(b.getProfit(), a.getProfit()));
+    private Move findBestCrossTransfer(Solution sol) {
+        Instance inst = sol.getInstance();
+        List<Route> routes = sol.getRoutes();
+        List<Node> unserved = getTopUnserved(sol, 15);
+        Move best = null;
 
         for (int i1 = 0; i1 < routes.size(); i1++) {
-            if (System.currentTimeMillis() - startTime > TIME_BUDGET_MS) break;
             Route k1 = routes.get(i1); k1.evaluate();
 
             for (int sj = 0; sj < k1.size(); sj++) {
                 RouteStop stopJ = k1.getStops().get(sj);
                 if (!stopJ.isServed()) continue;
+                // FIX: Constraint 9 (Cannot be a dropoff if we want to make it a pickup)
+                if (stopJ.isDropoff()) continue;
 
                 for (int i2 = 0; i2 < routes.size(); i2++) {
                     if (i1 == i2) continue;
@@ -117,12 +122,12 @@ public class TransformOperator {
                     for (Node u : unserved) {
                         double needed = u.getDemand() - k1.getRemainingCapacity();
                         if (needed <= 0 || needed > k2SpareCap) continue;
-                        if (best != null && u.getProfit() <= best.netProfit) continue;
 
-                        double transferQty = needed; // BUG FIXED: Transfer EXACTLY what is needed
+                        double transferQty = needed;
 
                         Route k2Copy = new Route(k2);
-                        k2Copy.insertStop(posK2, RouteStop.dropoff(stopJ.getNode(), transferQty));
+                        RouteStop dropoffStop = new RouteStop(stopJ.getNode(), false, false, true, 0, transferQty, 0);
+                        k2Copy.insertStop(posK2, dropoffStop);
                         k2Copy.evaluate();
                         if (!k2Copy.isFeasible()) continue;
 
@@ -130,14 +135,29 @@ public class TransformOperator {
                             Route k1Copy = new Route(k1);
                             k1Copy.insertStop(posU, RouteStop.serve(u));
                             int newPosJ = (posU <= sj) ? sj + 1 : sj;
-                            k1Copy.getStops().set(newPosJ, new RouteStop(stopJ.getNode(), true, true, false, transferQty, 0, stopJ.getNode().getDemand()));
+
+                            RouteStop pickerStop = new RouteStop(
+                                    stopJ.getNode(), stopJ.isServed(), true, stopJ.isDropoff(),
+                                    stopJ.getPickupQty() + transferQty, stopJ.getDropoffQty(), stopJ.getDeliveryQty()
+                            );
+                            k1Copy.getStops().set(newPosJ, pickerStop);
                             k1Copy.evaluate();
 
-                            if (k1Copy.isFeasible() && (k2Copy.getArrivalTimeAtNode(stopJ.getNode().getId()) - k1Copy.getArrivalTimeAtNode(stopJ.getNode().getId())) <= W + 1e-6) {
-                                best = new Move(); best.type = MoveType.CROSS_TRANSFER; best.netProfit = u.getProfit();
-                                best.insertNode = u; best.serverRouteIdx = i1; best.donorRouteIdx = i2;
-                                best.donorInsertPos = posK2; best.transferNode = stopJ.getNode();
-                                best.transferQty = transferQty; best.newCustInsertPos = posU;
+                            double giverTime = k2Copy.getArrivalTimeAtNode(stopJ.getNode().getId());
+                            double receiverRawTime = k1Copy.getArrivalTimeAtNode(stopJ.getNode().getId());
+                            double requiredWaitTime = Math.max(0.0, giverTime - receiverRawTime);
+                            pickerStop.setWaitingTime(requiredWaitTime);
+
+                            k1Copy.evaluate();
+
+                            if (k1Copy.isFeasible()) {
+                                double score = u.getProfit() * 1.5;
+                                if (best == null || score > best.netProfit) {
+                                    best = new Move(); best.type = MoveType.CROSS_TRANSFER; best.netProfit = score;
+                                    best.insertNode = u; best.serverRouteIdx = i1; best.donorRouteIdx = i2;
+                                    best.donorInsertPos = posK2; best.transferNode = stopJ.getNode();
+                                    best.transferQty = transferQty; best.newCustInsertPos = posU;
+                                }
                             }
                         }
                     }
@@ -147,13 +167,13 @@ public class TransformOperator {
         return best;
     }
 
-    private Move findBestReverseTransfer(Solution sol, long startTime) {
-        Instance inst = sol.getInstance(); double W = inst.getSyncWindow();
-        List<Route> routes = sol.getRoutes(); List<Node> unserved = sol.getUnservedNodes();
-        Move best = null; unserved.sort((a, b) -> Double.compare(b.getProfit(), a.getProfit()));
+    private Move findBestReverseTransfer(Solution sol) {
+        Instance inst = sol.getInstance();
+        List<Route> routes = sol.getRoutes();
+        List<Node> unserved = getTopUnserved(sol, 15);
+        Move best = null;
 
         for (int i2 = 0; i2 < routes.size(); i2++) {
-            if (System.currentTimeMillis() - startTime > TIME_BUDGET_MS) break;
             Route k2 = routes.get(i2); k2.evaluate();
             double k2SpareCap = k2.getRemainingCapacity();
             if (k2SpareCap < 1) continue;
@@ -161,6 +181,8 @@ public class TransformOperator {
             for (int sj = 0; sj < k2.size(); sj++) {
                 RouteStop stopJ = k2.getStops().get(sj);
                 if (!stopJ.isServed()) continue;
+                // FIX: Constraint 9 (Cannot be a pickup if we want to make it a dropoff)
+                if (stopJ.isPickup()) continue;
 
                 for (int i1 = 0; i1 < routes.size(); i1++) {
                     if (i1 == i2) continue;
@@ -171,26 +193,46 @@ public class TransformOperator {
                         for (Node u : unserved) {
                             double needed = u.getDemand() - k1.getRemainingCapacity();
                             if (needed <= 0 || needed > k2SpareCap) continue;
-                            if (best != null && u.getProfit() <= best.netProfit) continue;
 
-                            double transferQty = needed; // BUG FIXED
+                            double transferQty = needed;
 
                             Route k2Copy = new Route(k2);
-                            k2Copy.getStops().set(sj, RouteStop.serveAndDropoff(stopJ.getNode(), transferQty));
+                            RouteStop dropoffStop = new RouteStop(
+                                    stopJ.getNode(), stopJ.isServed(), stopJ.isPickup(), true,
+                                    stopJ.getPickupQty(), stopJ.getDropoffQty() + transferQty, stopJ.getDeliveryQty()
+                            );
+                            k2Copy.getStops().set(sj, dropoffStop);
                             k2Copy.evaluate();
                             if (!k2Copy.isFeasible()) continue;
 
                             for (int posU = 0; posU <= k1.size(); posU++) {
                                 Route k1Copy = new Route(k1);
-                                if (posU <= posJ) { k1Copy.insertStop(posU, RouteStop.serve(u)); k1Copy.insertStop(posJ + 1, RouteStop.pickup(stopJ.getNode(), transferQty)); }
-                                else { k1Copy.insertStop(posJ, RouteStop.pickup(stopJ.getNode(), transferQty)); k1Copy.insertStop(posU + 1, RouteStop.serve(u)); }
+                                RouteStop pickerStop = RouteStop.pickup(stopJ.getNode(), transferQty);
+
+                                if (posU <= posJ) {
+                                    k1Copy.insertStop(posU, RouteStop.serve(u));
+                                    k1Copy.insertStop(posJ + 1, pickerStop);
+                                } else {
+                                    k1Copy.insertStop(posJ, pickerStop);
+                                    k1Copy.insertStop(posU + 1, RouteStop.serve(u));
+                                }
                                 k1Copy.evaluate();
 
-                                if (k1Copy.isFeasible() && (k2Copy.getArrivalTimeAtNode(stopJ.getNode().getId()) - k1Copy.getArrivalTimeAtNode(stopJ.getNode().getId())) <= W + 1e-6) {
-                                    best = new Move(); best.type = MoveType.REVERSE_TRANSFER; best.netProfit = u.getProfit();
-                                    best.insertNode = u; best.serverRouteIdx = i2; best.donorRouteIdx = i1;
-                                    best.transferNode = stopJ.getNode(); best.transferQty = transferQty;
-                                    best.newCustInsertPos = posU; best.pickerInsertPos = posJ;
+                                double giverTime = k2Copy.getArrivalTimeAtNode(stopJ.getNode().getId());
+                                double receiverRawTime = k1Copy.getArrivalTimeAtNode(stopJ.getNode().getId());
+                                double requiredWaitTime = Math.max(0.0, giverTime - receiverRawTime);
+                                pickerStop.setWaitingTime(requiredWaitTime);
+
+                                k1Copy.evaluate();
+
+                                if (k1Copy.isFeasible()) {
+                                    double score = u.getProfit() * 1.5;
+                                    if (best == null || score > best.netProfit) {
+                                        best = new Move(); best.type = MoveType.REVERSE_TRANSFER; best.netProfit = score;
+                                        best.insertNode = u; best.serverRouteIdx = i2; best.donorRouteIdx = i1;
+                                        best.transferNode = stopJ.getNode(); best.transferQty = transferQty;
+                                        best.newCustInsertPos = posU; best.pickerInsertPos = posJ;
+                                    }
                                 }
                             }
                         }
@@ -213,14 +255,16 @@ public class TransformOperator {
         } else if (move.type == MoveType.CROSS_TRANSFER) {
             Route k1 = routes.get(move.serverRouteIdx); Route k2 = routes.get(move.donorRouteIdx);
             k1.insertStop(move.newCustInsertPos, RouteStop.serve(move.insertNode));
-            k1.getStops().set(k1.findStopIndex(move.transferNode.getId()), new RouteStop(move.transferNode, true, true, false, move.transferQty, 0, move.transferNode.getDemand()));
+            RouteStop stopJ = k1.getStops().get(k1.findStopIndex(move.transferNode.getId()));
+            k1.getStops().set(k1.findStopIndex(move.transferNode.getId()), new RouteStop(move.transferNode, stopJ.isServed(), true, stopJ.isDropoff(), stopJ.getPickupQty() + move.transferQty, stopJ.getDropoffQty(), stopJ.getDeliveryQty()));
             k1.evaluate();
             k2.insertStop(move.donorInsertPos, RouteStop.dropoff(move.transferNode, move.transferQty));
             k2.evaluate();
             sol.addTransfer(new Transfer(move.transferNode.getId(), k2.getVehicleId(), k1.getVehicleId(), move.transferQty));
         } else if (move.type == MoveType.REVERSE_TRANSFER) {
             Route k2 = routes.get(move.serverRouteIdx); Route k1 = routes.get(move.donorRouteIdx);
-            k2.getStops().set(k2.findStopIndex(move.transferNode.getId()), RouteStop.serveAndDropoff(move.transferNode, move.transferQty));
+            RouteStop stopJ = k2.getStops().get(k2.findStopIndex(move.transferNode.getId()));
+            k2.getStops().set(k2.findStopIndex(move.transferNode.getId()), new RouteStop(move.transferNode, stopJ.isServed(), stopJ.isPickup(), true, stopJ.getPickupQty(), stopJ.getDropoffQty() + move.transferQty, stopJ.getDeliveryQty()));
             k2.evaluate();
             if (move.newCustInsertPos <= move.pickerInsertPos) { k1.insertStop(move.newCustInsertPos, RouteStop.serve(move.insertNode)); k1.insertStop(move.pickerInsertPos + 1, RouteStop.pickup(move.transferNode, move.transferQty)); }
             else { k1.insertStop(move.pickerInsertPos, RouteStop.pickup(move.transferNode, move.transferQty)); k1.insertStop(move.newCustInsertPos + 1, RouteStop.serve(move.insertNode)); }

@@ -28,7 +28,8 @@ public class LocalSearch {
                 for (int j = i + 1; j < n; j++) {
                     reverseSegment(stops, i, j);
                     route.evaluate();
-                    if (route.isFeasible() && route.getTotalDistance() < bestDist - 1e-6) {
+                    // FIX: Enforce global feasibility to protect transfers!
+                    if (route.isFeasible() && solution.isFeasible() && route.getTotalDistance() < bestDist - 1e-6) {
                         bestDist = route.getTotalDistance();
                         totalImprovements++; return true;
                     } else {
@@ -66,7 +67,8 @@ public class LocalSearch {
                     Route target = routes.get(r2);
                     for (int tPos = 0; tPos <= target.size(); tPos++) {
                         target.insertStop(tPos, stop); target.evaluate();
-                        if (target.isFeasible()) {
+                        // FIX: Enforce global feasibility
+                        if (target.isFeasible() && solution.isFeasible()) {
                             double improvement = computeObjective(solution) - currentObj;
                             if (improvement > bestImprovement + 1e-6) {
                                 bestImprovement = improvement; bestSourceRoute = r1; bestSourcePos = sPos; bestTargetRoute = r2; bestTargetPos = tPos;
@@ -105,7 +107,8 @@ public class LocalSearch {
                         route1.getStops().set(p1, stop2); route2.getStops().set(p2, stop1);
                         route1.evaluate(); route2.evaluate();
 
-                        if (route1.isFeasible() && route2.isFeasible()) {
+                        // FIX: Enforce global feasibility
+                        if (route1.isFeasible() && route2.isFeasible() && solution.isFeasible()) {
                             double improvement = computeObjective(solution) - currentObj;
                             if (improvement > bestImprovement + 1e-6) {
                                 bestImprovement = improvement; bestR1 = r1; bestPos1 = p1; bestR2 = r2; bestPos2 = p2;
@@ -137,7 +140,6 @@ public class LocalSearch {
             Route route = routes.get(ri);
             for (int sPos = 0; sPos < route.size(); sPos++) {
                 RouteStop served = route.getStops().get(sPos);
-                // SAFEGUARD: Do not destroy split deliveries during simple replacement
                 if (!served.isServed() || served.isSplitDelivery()) continue;
 
                 route.removeStop(sPos); route.evaluate();
@@ -147,7 +149,9 @@ public class LocalSearch {
                         Route target = routes.get(r2);
                         for (int iPos = 0; iPos <= target.size(); iPos++) {
                             target.insertStop(iPos, RouteStop.serve(uNode)); target.evaluate();
-                            if (target.isFeasible()) {
+
+                            // FIX: Enforce global feasibility
+                            if (target.isFeasible() && solution.isFeasible()) {
                                 double improvement = computeObjective(solution) - currentObj;
                                 if (improvement > bestImprovement + 1e-6) {
                                     bestImprovement = improvement; bestRouteIdx = ri; bestRemovePos = sPos; bestInsertRoute = r2; bestInsertPos = iPos; bestUnserved = uNode;
@@ -170,10 +174,6 @@ public class LocalSearch {
         }
         return false;
     }
-
-    // ══════════════════════════════════════════════════════════
-    // SPLIT-AWARE POST INSERTION (Crucial for SD-CTOP)
-    // ══════════════════════════════════════════════════════════
 
     private static class InsertionPlan {
         List<Route> routes = new ArrayList<>(); List<Integer> positions = new ArrayList<>(); List<Double> quantities = new ArrayList<>(); double score;
@@ -236,12 +236,26 @@ public class LocalSearch {
             }
 
             if (bestPlan != null) {
+                // Apply the plan
                 for (int i = 0; i < bestPlan.routes.size(); i++) {
                     Route r = bestPlan.routes.get(i);
                     r.insertStop(bestPlan.positions.get(i), RouteStop.servePartial(bestNode, bestPlan.quantities.get(i)));
                     r.evaluate();
                 }
-                inserted++; improved = true;
+
+                // FIX: Check if the insertion broke synchronization elsewhere
+                if (solution.isFeasible()) {
+                    inserted++; improved = true;
+                } else {
+                    // Revert the plan and skip this node
+                    for (int i = 0; i < bestPlan.routes.size(); i++) {
+                        Route r = bestPlan.routes.get(i);
+                        r.removeStop(bestPlan.positions.get(i));
+                        r.evaluate();
+                    }
+                    candidates.remove(bestNode);
+                    improved = true; // Continue the while loop with the node removed
+                }
             }
         }
         return inserted;
